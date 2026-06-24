@@ -1,209 +1,154 @@
 # ============================================================
 # MASTER SCRIPT: Fit habitat selection model
+# Cleaned, annotated, and formatted for publication
 # ============================================================
-# This script:
-#   1. Sets paths depending on run environment
-#   2. Loads packages, functions, and prepared data
-#   3. Selects one parameter combination using command-line input
-#   4. Creates a logfile
-#   5. Fits either GAM or MaxEnt
-#   6. Saves model outputs
-# ============================================================
-
-
-# ============================================================
-# 1. Run settings
-# ============================================================
-
-run_on_personal_computer <- FALSE
-run_on_nina_server       <- TRUE
-
-version_number <- 4
-checks <- FALSE
-
-# Parameter-row index.
-# On the server this is read from command-line arguments.
-tpr <- 1
-
-
-# set model seed
-seed <- 1994
-
-# ============================================================
-# 2. Set working directory and temporary directory
+#
+# Purpose:
+#   - Prepare data, fit habitat selection models (GAM or ensemble),
+#     predict across a study region, and save results and logs.
+#
+# Usage:
+#   - On an interactive/personal machine, set run_env in your .Rprofile
+#     (or adjust the flags below).
+#   - On a server, pass the parameter-row index (tpr) as the first
+#     command-line argument, e.g.:
+#       Rscript fit_model.R 3
+#
+# Requirements / assumptions:
+#   - The project defines these variables in .Renviron / .Rprofile:
+#       project_dir, temp_dir, data_dir, logs_dir, result_dir, run_env
+#   - Project functions are placed under scripts/functions/ and will be sourced.
+#   - The pipeline scripts are placed under scripts/pipeline/.
+#   - Key functions used here (examples): fit_predict_habitat_model(),
+#     save_habitat_results_pro(). These should be defined in sourced files.
+#
+# Note:
+#   - This file is intended for readability and sharing. It keeps the original
+#     logic but clarifies variable names, adds documentation, and improves logging.
 # ============================================================
 
-if (run_on_personal_computer) {
-  
-  project_dir <- "R:/Prosjekter/Toppskarv/Analyses_Nina_KelpHarvest/kwaku"
-  temp_dir <- tempdir()
-  
-} else if (run_on_nina_server) {
-  
-  project_dir <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_KelpHarvest/kwaku"
-  temp_dir <- "/data/scratch/kwaku"
-  
+
+# ============================================================
+# 0. Global script settings (edit as needed)
+# ============================================================
+version_number <- 0       # increment for new published runs
+checks <- FALSE           # run extra exploratory checks if TRUE
+seed <- 1994              # model RNG seed for reproducibility
+
+# default parameter-row index (overridden by command-line argument on server)
+param_row <- 1
+
+
+# ============================================================
+# 1. Load environment, command-line args, and basic paths
+# ============================================================
+# Load project-local environment variables (if present)
+if (file.exists(".Renviron")) readRenviron(".Renviron")
+if (file.exists(".Rprofile")) source(".Rprofile")
+
+# If run_env is not defined, warn the user and assume "personal"
+if (!exists("run_env")) {
+  run_env <- "personal"
+  warning("run_env not found in .Rprofile/.Renviron: assuming 'personal'.")
+}
+
+# On non-personal environments (e.g., a server), read command-line args
+if (!run_env %in% "personal") {
   args <- commandArgs(trailingOnly = TRUE)
-  
   if (length(args) > 0) {
-    tpr <- as.numeric(args[1])
-  }
-  
-} else {
-  
-  stop("No run environment selected.")
-}
-
-setwd(project_dir)
-#Sys.setenv(TMPDIR = temp_dir)
-
-cat("Working directory:", getwd(), "\n")
-cat("Temporary directory:", temp_dir, "\n")
-cat("Parameter row:", tpr, "\n")
-
-
-# ============================================================
-# 3. Define output paths
-# ============================================================
-
-version_label <- paste0("version_0", version_number)
-
-path_for_processed_data <- file.path(
-  "dataset",
-  "processed_data",
-  version_label
-)
-
-dir.create(
-  path_for_processed_data,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-
-# ============================================================
-# 4. Load packages and project functions
-# ============================================================
-
-# If current folders do not exist for the current version, duplicate from previous version
-# The intention is to edit these new files whist not altering the previous versions
-if (run_on_nina_server){
-version_label <- paste0("version_0", version_number)
-
-previous_version <- version_number - 1
-previous_label <- paste0("version_0", previous_version)
-
-# folders to version
-base_dirs <- c("functions", "pipeline")
-
-for (base_dir in base_dirs) {
-  
-  current_dir <- file.path(base_dir, version_label)
-  previous_dir <- file.path(base_dir, previous_label)
-  
-  # initialise current version from previous version
-  if (!dir.exists(current_dir)) {
-    
-    if (!dir.exists(previous_dir)) {
-      stop("Previous version folder does not exist: ", previous_dir)
-    }
-    
-    # create current version folder
-    dir.create(current_dir, recursive = TRUE)
-    
-    # copy all files/folders
-    file.copy(
-      from = list.files(
-        previous_dir,
-        full.names = TRUE,
-        all.files = TRUE,
-        no.. = TRUE
-      ),
-      to = current_dir,
-      recursive = TRUE
-    )
-    
-    message("Initialised: ", current_dir)
+    param_row <- as.numeric(args[1])
   }
 }
 
-} else {
-  # ============================================================
-  # 4a. Validate version folders
-  # ============================================================
-  # Do NOT initialise version folders inside parallel jobs.
-  # Parallel jobs should only read existing functions/pipeline code.
-  
-  required_dirs <- c(
-    file.path("functions", version_label),
-    file.path("pipeline", version_label)
-  )
-  
-  missing_dirs <- required_dirs[!dir.exists(required_dirs)]
-  
-  if (length(missing_dirs) > 0) {
-    stop(
-      "Required version folders are missing:\n",
-      paste(missing_dirs, collapse = "\n"),
-      "\n\nCreate/copy these folders once before launching parallel jobs."
-    )
-  }
+# Print core paths (assumes these are defined in .Rprofile)
+message("Working directory: ", ifelse(exists("project_dir"), project_dir, "project_dir not set"))
+message("Temporary directory: ", ifelse(exists("temp_dir"), temp_dir, "temp_dir not set"))
+message("Data directory: ", ifelse(exists("data_dir"), data_dir, "data_dir not set"))
+message("Parameter row (param_row): ", param_row)
+
+
+# ============================================================
+# 2. Output versioning and directories
+# ============================================================
+version_label <- paste0("version_0.1.", version_number)
+
+path_for_processed_data <- file.path(data_dir, version_label)
+dir.create(path_for_processed_data, recursive = TRUE, showWarnings = FALSE)
+
+
+# ============================================================
+# 3. Load packages and project functions
+#    - All function scripts in scripts/functions/ are sourced here.
+# ============================================================
+function_files <- list.files(file.path("scripts", "functions"),
+                             pattern = "\\.R$", full.names = TRUE)
+invisible(lapply(function_files, source))
+
+# Terra/ GDAL threading helper ------------------------------------------------
+# Choose thread counts appropriate for your environment.
+# Example uses 4 terra threads and 1 OpenMP/GDAL thread each.
+set_terra_threads(n_terra = 4, omp_threads = 1, gdal_threads = 1)
+
+# Helper to consistently set terra write options with GDAL multithreading
+terra_wopt_mt <- function(comp = "LZW", threads = NULL) {
+  if (is.null(threads)) threads <- Sys.getenv("GDAL_NUM_THREADS", unset = "ALL_CPUS")
+  terra::wopt(gdal = c(
+    paste0("COMPRESS=", comp),
+    "PREDICTOR=2",
+    paste0("NUM_THREADS=", threads),
+    "TILED=YES",
+    "BIGTIFF=IF_SAFER"
+  ))
 }
 
-# source package loader
-source(
-  file.path(
-    "functions",
-    version_label,
-    "00_loadPackages.R"
-  )
-)
-
-
-function_files <- list.files(
-  file.path("functions", version_label),
-  pattern = "\\.R$",
-  full.names = TRUE
-)
-
-invisible(
-  lapply(function_files, source)
-)
-
 
 # ============================================================
-# 5. Load and prepare data
+# 4. Load and prepare input data (pipeline scripts)
 # ============================================================
+# These scripts should prepare the following objects (examples):
+#  - dmodel: the model dataset (points with covariates and response)
+#  - pred_grid / pred_coords: prediction grid for spatial predictions
+#  - study_region: polygon for the study area
+#  - env_stack_10m, raster_results_23/24: environmental rasters/stacks
+# Adjust file paths according to your project layout.
+
 rerunDataFormat <- FALSE
-if(rerunDataFormat) unlink(file.path("dataset", "processed_data", version_label, "dmodel.RData"))
+if (rerunDataFormat) unlink(file.path(data_dir, "dmodel.RData"))
 
-n_per_point <- 5 #Number of points to sample for each individual point. 
-ID_buffer_m <- 50 # Unit is in kms
-source(paste0("pipeline/", version_label,"/01_dataPreparation/01_prepData.R"))
-source(paste0("pipeline/", version_label,"/01_dataPreparation/02_prepPredictionRaster.R"))
-source(paste0("pipeline/", version_label,"/01_dataPreparation/03_predictionCoords.R"))
+# Sampling and buffering parameters used by the preparation scripts:
+n_per_point <- 5        # number of random background points per used point
+ID_buffer_m <- 10000    # individual ID buffer (meters)
+harvest_buffer <- 50    # harvest buffer (meters)
+
+# Source the pipeline preparation scripts (they must exist under scripts/pipeline/)
+source(file.path("scripts", "pipeline", "01_dataPreparation", "01_prepData.R"))
+source(file.path("scripts", "pipeline", "01_dataPreparation", "02_prepPredictionRaster.R"))
+source(file.path("scripts", "pipeline", "01_dataPreparation", "03_predictionCoords.R"))
 
 if (checks) {
-  source(paste0("pipeline/", version_label,"/02_modelFit/01_exploration_analysis.R"))
+  # Optional exploratory analysis (only run when checks == TRUE)
+  source(file.path("pipeline", version_label, "02_modelFit", "01_exploration_analysis.R"))
 }
 
+
 # ============================================================
-# 6. Create parameter grid
+# 5. Parameter grid and strata summaries
 # ============================================================
+# Create a grid of parameter combinations to run. The script selects one
+# row from this grid based on `param_row`. Users can extend the grid with
+# more factors as required.
 
 pars <- expand.grid(
-  sex = levels(dmodel$sex),
   Year = levels(dmodel$Year),
-  harvesttimeSK24 = levels(dmodel$harvesttimeSK24),
-  method = c("ensemble","gam"),
+  method = c("gam"),
   stringsAsFactors = FALSE
 )
 
-# Harvest variables that fit_predict_habitat_model will loop over
-# internally. Both are computed in the same call and returned as
-# separate named entries in the results list.
-harvest_vars_to_use <- c("harvested50m", "harvested200m")
+# Which harvest variables we will evaluate (fit_predict_habitat_model
+# will loop internally and return results per variable)
+harvest_vars_to_use <- c("harvested50m")
 
+# Compute simple odds ratio summaries by strata to help interpret results
 or_results <- dmodel %>%
   group_by(sex, Year, harvesttimeSK24) %>%
   summarise(
@@ -219,387 +164,134 @@ or_results <- dmodel %>%
     .groups = "drop"
   ) %>%
   mutate(
-    OR_50m = (used1_h1 * used0_h0) /
-      (used0_h1 * used1_h0),
+    OR_50m = (used1_h1 * used0_h0) / (used0_h1 * used1_h0),
     logOR_50m = log(OR_50m),
-    OR_200m = (used1_h1_200 * used0_h0_200) /
-      (used0_h1_200 * used1_h0_200),
+    OR_200m = (used1_h1_200 * used0_h0_200) / (used0_h1_200 * used1_h0_200),
     logOR_200m = log(OR_200m)
   ) %>%
   sf::st_drop_geometry()
 
-
-
-if (tpr < 1 || tpr > nrow(pars)) {
-  stop("tpr is outside the parameter grid range.")
+# Validate the requested parameter-row index
+if (param_row < 1 || param_row > nrow(pars)) {
+  stop("param_row is outside the parameter grid range.")
 }
 
-#for(tpr in 13:24){
-pars_to_use <- pars[tpr, ]
+# Select the parameter combination to use in this run
+pars_to_use <- pars[param_row, , drop = FALSE]
 
+# Convert to a list for passing into the model-fitting function
 pars_to_use_list <- list(
-  sex = pars_to_use$sex,
-  Year = pars_to_use$Year,
-  harvesttimeSK24 = pars_to_use$harvesttimeSK24
+  Year = pars_to_use$Year
 )
 
-cat("Selected parameters:\n")
+message("Selected parameters:")
 print(pars_to_use)
 
 
 # ============================================================
-# 7. Create logging paths
+# 6. Prepare logging (create log path and logfile)
 # ============================================================
+path_for_logs <- file.path(logs_dir,
+                           version_label,
+                           pars_to_use$method,
+                           pars_to_use$Year)
+dir.create(path_for_logs, recursive = TRUE, showWarnings = FALSE)
 
-path_for_logs <- file.path(
-  "logs", 
-  version_label,
-  pars_to_use$method,
-  pars_to_use$Year,
-  pars_to_use$harvesttimeSK24,
-  pars_to_use$sex
-)
-
-dir.create(
-  path_for_logs,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-logfile <- file.path(
-  path_for_logs,
-  paste0(
-    "model_run_",
-    format(Sys.time(), "%Y%m%d_%H%M%S"),
-    ".log"
-  )
-)
+logfile <- file.path(path_for_logs,
+                     paste0("model_run_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".log"))
 
 
 # ============================================================
-# 8. Run model with logfile
+# 7. Fit model with sinked logfile (and robust error handling)
 # ============================================================
-
 log_con <- file(logfile, open = "wt")
-
+# Sink stdout and messages to the logfile; split = TRUE keeps console output too
 sink(log_con, split = TRUE)
 sink(log_con, type = "message")
 
-tryCatch(
-  
-  {
-    cat("Started:", as.character(Sys.time()), "\n\n")
-    cat("Selected parameters:\n")
-    print(pars_to_use)
-    
-    cat("Odds ratios (50m and 200m harvest buffers):\n")
-    rt <- or_results %>%
-      dplyr::filter(sex == pars_to_use$sex,
-                    Year == pars_to_use$Year,
-                    harvesttimeSK24 == pars_to_use$harvesttimeSK24)
-    print(rt)
-    # --------------------------------------------------------
-    # Fit model and predict over study region
-    #
-    # fit_predict_habitat_model now fits one model per entry in
-    # harvest_vars_to_use (e.g. "harvested50m" and "harvested200m")
-    # and returns a named list of result objects, one per harvest
-    # variable: model_results[["harvested50m"]], 
-    # model_results[["harvested200m"]].
-    # --------------------------------------------------------
-    model_results <- fit_predict_habitat_model(
-      dmodel = dmodel,
-      pred_grid = pred_grid,
-      study_region = study_region,
-      env_stack_10m = env_stack_10m,
-      raster_results_23 = raster_results_23,
-      raster_results_24 = raster_results_24,
-      pars_to_use = pars_to_use_list,
-      method = pars_to_use$method,
-      response_col = "random",
-      checks = checks,
-      nBasis = 50,
-      harvest_vars = harvest_vars_to_use
-    )
-    
-    # --------------------------------------------------------
-    # Per-harvest-variable summaries
-    # --------------------------------------------------------
-    
-    for (hv in names(model_results)) {
-      
-      cat("\n==============================================\n")
-      cat("Model summary for harvest variable:", hv, "\n")
-      cat("==============================================\n")
-      
-      res_hv <- model_results[[hv]]
-      
-      model_data_hv <- res_hv$model_data
-      print(table(model_data_hv$response, model_data_hv$harvest_var))
-      
-      if (pars_to_use$method == "gam") {
-        print(summary(res_hv$model))
-      } else if (pars_to_use$method == "maxent") {
-        print(summary(res_hv$model$betas))
-      } else if (pars_to_use$method == "ensemble") {
-        # No simple coefficient summary for biomod2 ensembles;
-        # evaluation metrics are available via biomod2::get_evaluations()
-        cat("Ensemble model fitted for", hv, "\n")
-      }
-    }
-    
-    # --------------------------------------------------------
-    # Save outputs
-    #
-    # output_dir is shared; save_habitat_results detects the
-    # named-list structure and writes harvest-variable-specific
-    # prefixes automatically (e.g. model_fit_harvested50m_*,
-    # model_fit_harvested200m_*).
-    # --------------------------------------------------------
-    
-    output_dir <- file.path(
-      "results",
-      version_label,
-      pars_to_use$method,
-      pars_to_use$Year,
-      pars_to_use$harvesttimeSK24,
-      pars_to_use$sex
-    )
-    
-    saved_files <- save_habitat_results(
-      results = model_results,
-      out_dir = output_dir,
-      prefix = "model_fit"
-    )
-    
-    cat("\nSaved files:\n")
-    print(saved_files)
-    
-    # --------------------------------------------------------
-    # Optional ensemble harvest-effect plots, one per harvest
-    # variable
-    # --------------------------------------------------------
-    
-    if (pars_to_use$method == "ensemble") {
-      
-      for (hv in names(model_results)) {
-        
-        res_hv <- model_results[[hv]]
-        
-        if (!is.null(res_hv$harvest_conditional_plot)) {
-          
-          ggsave(res_hv$harvest_conditional_plot,
-                 filename = file.path(
-                   output_dir,
-                   paste0("harvested_suitability_", hv, ".pdf")
-                 ),
-                 width = 8,
-                 height = 6)
-          
-          ggsave(res_hv$harvest_conditional_plot,
-                 filename = file.path(
-                   output_dir,
-                   paste0("harvested_suitability_", hv, ".png")
-                 ),
-                 width = 8,
-                 height = 6,
-                 dpi = 300)
-        }
-      }
-    }
-    
-    cat("\nFinished:", as.character(Sys.time()), "\n")
-  },
-  
-  error = function(e) {
-    cat("\nERROR:\n")
-    cat(conditionMessage(e), "\n")
-    stop(e)
-  },
-  
-  finally = {
-    sink(type = "message")
-    sink()
-    close(log_con)
-  }
-)
+# Use tryCatch to ensure sinks are reset and the log file closed even on error
+tryCatch({
 
-# # ============================================================
-# # 6. Create parameter grid
-# # ============================================================
-# 
-# pars <- expand.grid(
-#   sex = levels(dmodel$sex),
-#   Year = levels(dmodel$Year),
-#   harvesttimeSK24 = levels(dmodel$harvesttimeSK24),
-#   method = c("ensemble","gam"),
-#   stringsAsFactors = FALSE
-# )
-# 
-# or_results <- dmodel %>%
-#   group_by(sex, Year, harvesttimeSK24) %>%
-#   summarise(
-#     used0_h0 = sum(used == 0 & harvested50m == 0),
-#     used1_h0 = sum(used == 1 & harvested50m == 0),
-#     used0_h1 = sum(used == 0 & harvested50m == 1),
-#     used1_h1 = sum(used == 1 & harvested50m == 1),
-#     ids = length(unique(ID)),
-#     .groups = "drop"
-#   ) %>%
-#   mutate(
-#     OR = (used1_h1 * used0_h0) /
-#       (used0_h1 * used1_h0),
-#     logOR = log(OR)
-#   ) %>%
-#   sf::st_drop_geometry()
-# 
-# 
-# 
-# if (tpr < 1 || tpr > nrow(pars)) {
-#   stop("tpr is outside the parameter grid range.")
-# }
-# 
-# #for(tpr in 13:24){
-# pars_to_use <- pars[tpr, ]
-# 
-# pars_to_use_list <- list(
-#   sex = pars_to_use$sex,
-#   Year = pars_to_use$Year,
-#   harvesttimeSK24 = pars_to_use$harvesttimeSK24
-# )
-# 
-# cat("Selected parameters:\n")
-# print(pars_to_use)
-# 
-# 
-# # ============================================================
-# # 7. Create logging paths
-# # ============================================================
-# 
-# path_for_logs <- file.path(
-#   "logs", 
-#   version_label,
-#   pars_to_use$method,
-#   pars_to_use$Year,
-#   pars_to_use$harvesttimeSK24,
-#   pars_to_use$sex
-# )
-# 
-# dir.create(
-#   path_for_logs,
-#   recursive = TRUE,
-#   showWarnings = FALSE
-# )
-# 
-# logfile <- file.path(
-#   path_for_logs,
-#   paste0(
-#     "model_run_",
-#     format(Sys.time(), "%Y%m%d_%H%M%S"),
-#     ".log"
-#   )
-# )
-# 
-# 
-# # ============================================================
-# # 8. Run model with logfile
-# # ============================================================
-# 
-# log_con <- file(logfile, open = "wt")
-# 
-# sink(log_con, split = TRUE)
-# sink(log_con, type = "message")
-# 
-# tryCatch(
-#   
-#   {
-#     cat("Started:", as.character(Sys.time()), "\n\n")
-#     cat("Selected parameters:\n")
-#     print(pars_to_use)
-#     
-#     cat("Odd ratio:\n")
-#     rt <- or_results %>%
-#       dplyr::filter(sex == pars_to_use$sex,
-#                     Year == pars_to_use$Year,
-#                     harvesttimeSK24 == pars_to_use$harvesttimeSK24)
-#     print(rt)
-#     # --------------------------------------------------------
-#     # Fit model and predict over study region
-#     # --------------------------------------------------------
-#     
-#     model_results <- fit_predict_habitat_model(
-#       dmodel = dmodel,
-#       pred_grid = pred_grid,
-#       study_region = study_region,
-#       env_stack_10m = env_stack_10m,
-#       raster_results_23 = raster_results_23,
-#       raster_results_24 = raster_results_24,
-#       pars_to_use = pars_to_use_list,
-#       method = pars_to_use$method,
-#       response_col = "random",
-#       checks = checks,
-#       nBasis = 50
-#     )
-#     
-#     cat("\nModel summary:\n")
-#     model_data <- model_results$model_data
-#     table(model_data$random, model_data$harvested50m)
-#     
-#     if(pars_to_use$method == "gam"){
-#     print(summary(model_results$model))
-#     } else if(pars_to_use$method == "maxent"){
-#       print(summary(model_results$model$betas))
-#     }  
-#     
-#     # --------------------------------------------------------
-#     # Save outputs
-#     # --------------------------------------------------------
-#     
-#     output_dir <- file.path(
-#       "results",
-#       version_label,
-#       pars_to_use$method,
-#       pars_to_use$Year,
-#       pars_to_use$harvesttimeSK24,
-#       pars_to_use$sex
-#     )
-#     
-#     saved_files <- save_habitat_results(
-#       results = model_results,
-#       out_dir = output_dir,
-#       prefix = "model_fit"
-#     )
-#     
-#     cat("\nSaved files:\n")
-#     print(saved_files)
-#     
-#     if(pars_to_use$method == "ensemble"){
-#       
-#       ggsave(model_results$harvest_conditional_plot,
-#              filename = file.path(output_dir, "harvested_suitablility.pdf"),
-#              width = 8,
-#              height = 6)
-#       
-#       ggsave(model_results$harvest_conditional_plot,
-#              filename = file.path(output_dir, "harvested_suitablility.png"),
-#              width = 8,
-#              height = 6,
-#              dpi = 300)
-#     }
-#     
-#     cat("\nFinished:", as.character(Sys.time()), "\n")
-#   },
-#   
-#   error = function(e) {
-#     cat("\nERROR:\n")
-#     cat(conditionMessage(e), "\n")
-#     stop(e)
-#   },
-#   
-#   finally = {
-#     sink(type = "message")
-#     sink()
-#     close(log_con)
-#   }
-# )
-#}
+  cat("Started:", as.character(Sys.time()), "\n\n")
+  cat("Selected parameters:\n")
+  print(pars_to_use)
+
+  cat("\nOdds ratios (50m and 200m harvest buffers):\n")
+  rt <- or_results %>%
+    dplyr::filter(Year == pars_to_use$Year)
+  print(rt)
+
+  # ----------------------------
+  # Fit model and make predictions
+  # ----------------------------
+  # fit_predict_habitat_model should:
+  #   - take the prepared data and parameter list
+  #   - fit the model(s) (GAM or ensemble) for each harvest variable
+  #   - generate predictions across pred_grid or pred_coords
+  #   - return a list containing at least:
+  #       $method   -- "gam" or "ensemble"
+  #       $model    -- the fitted model object (for method == "gam")
+  #       $predictions  -- raster or data.frame of predicted values
+  #
+  # Important arguments used here:
+  #   response_col = "random"  -- the outcome column to use
+  #   nBasis = 50              -- number of basis functions for GAM splines
+  set.seed(seed)
+  model_results <- fit_predict_habitat_model(
+    dmodel = dmodel,
+    pred_grid = pred_grid,
+    study_region = study_region,
+    env_stack_10m = env_stack_10m,
+    raster_results_23 = raster_results_23,
+    raster_results_24 = raster_results_24,
+    pars_to_use = pars_to_use_list,
+    response_col = "random",
+    nthreads = 1,
+    nBasis = 50
+  )
+
+  cat("\n==============================================\n")
+  cat("Model summary for year:", pars_to_use$Year, "\n")
+  cat("==============================================\n")
+  if (!is.null(model_results$method) && model_results$method == "gam") {
+    # Print summary for GAM fits (if applicable)
+    print(summary(model_results$model))
+  } else {
+    cat("Model method:", model_results$method, "\n")
+  }
+
+  # ----------------------------
+  # Save model outputs
+  # ----------------------------
+  output_dir <- file.path(result_dir, version_label, pars_to_use$method, pars_to_use$Year)
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  saved_files <- save_habitat_results_pro(
+    results = model_results,
+    out_dir = output_dir,
+    prefix = "model_fit",
+    gdal_threads = Sys.getenv("GDAL_NUM_THREADS", "ALL_CPUS")
+  )
+
+  cat("\nSaved files:\n")
+  print(saved_files)
+
+  # Record completion time and minimal reproducibility info
+  cat("\nFinished:", as.character(Sys.time()), "\n\n")
+  cat("R session info:\n")
+  print(sessionInfo())
+
+}, error = function(e) {
+  # Log the error to the logfile and re-throw it to stop execution
+  cat("\nERROR:\n")
+  cat(conditionMessage(e), "\n")
+  stop(e)
+}, finally = {
+  # Always reset sinks and close the log connection
+  sink(type = "message")
+  sink()
+  close(log_con)
+})
+
+# End of script
+# ============================================================

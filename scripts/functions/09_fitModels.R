@@ -1,1395 +1,336 @@
-fit_predict_habitat_model <- function(dmodel,
-                                      pred_grid,
-                                      study_region,
-                                      env_stack_10m,
-                                      raster_results_23,
-                                      raster_results_24,
-                                      pars_to_use,
-                                      method = c("gam", "maxent", "ensemble"),
-                                      response_col = "used",
-                                      checks = FALSE,
-                                      block_size_m = 50000,
-                                      n_cv_folds = 5,
-                                      seed = 123,
-                                      nBasis = 10,
-                                      harvest_vars = c("harvested50m", "harvested200m")) {
-  
-  # ==========================================================
-  # PURPOSE
-  # ==========================================================
-  # Fit habitat selection / suitability models using used/random
-  # point data, spatial block cross-validation, individual ID effects,
-  # and prediction over a spatial grid.
-  #
-  # Supported methods:
-  #   - "gam"      : mgcv GAM with ID random effect
-  #   - "maxent"   : maxnet MaxEnt with ID dummy effects
-  #   - "ensemble" : biomod2 ensemble with ID dummy effects
-  #
-  # Important reproducibility choices:
-  #   - Continuous predictors are scaled using model data only.
-  #   - Spatial CV blocks are created once and reused.
-  #   - seed controls block assignment reproducibility.
-  #   - ID effects are included during fitting but excluded from predictions.
-  #   - Predictions are masked to tareskog == 1.
-  #
-  # harvest_vars:
-  #   - Character vector of harvest covariate names to fit, one model
-  #     per element (e.g. c("harvested50m", "harvested200m")).
-  #   - For each entry, that variable is used as the "harvest" covariate
-  #     in the model formula / predictors. Spatial blocks, scaling
-  #     parameters, and ID dummies are computed once and shared across
-  #     all entries so results are directly comparable.
-  #   - The function returns a named list of result objects, one per
-  #     harvest_vars entry, each with the same structure previously
-  #     returned for a single model.
-  #
-  # Based on the modelling workflow you shared. 
-  # :contentReference[oaicite:0]{index=0}
-  # ==========================================================
-  
-  method <- match.arg(method)
-  
-  if (!is.character(harvest_vars) || length(harvest_vars) == 0) {
-    stop("harvest_vars must be a non-empty character vector.")
-  }
-  
-  # ==========================================================
-  # 0. Package checks
-  # ==========================================================
-  # Fail early if required packages are missing.
-  
-  if (!requireNamespace("blockCV", quietly = TRUE)) {
-    stop("Package 'blockCV' is required.")
-  }
-  
-  if (method == "maxent" && !requireNamespace("maxnet", quietly = TRUE)) {
-    stop("Package 'maxnet' is required for method = 'maxent'.")
-  }
-  
-  if (method == "ensemble" && !requireNamespace("biomod2", quietly = TRUE)) {
-    stop("Package 'biomod2' is required for method = 'ensemble'.")
-  }
-  
-  if (!"tareskog" %in% names(env_stack_10m)) {
-    stop("env_stack_10m must contain a raster layer named 'tareskog'.")
-  }
-  
-  # ==========================================================
-  # 1. Filter model data
-  # ==========================================================
-  # Restrict analysis to one sex × year × harvest-period combination.
-  # pars_to_use must contain:
-  #   - sex
-  #   - Year
-  #   - harvesttimeSK24
-  
-  cat("Preparing model data...\n")
-  
+#' Fit habitat selection GAM and produce predictions & diagnostic plots
+#'
+#' This wrapper fits a binomial GAM to a spatial use/availability dataset and
+#' returns the fitted model, model data, prediction objects, and diagnostic plots.
+#'
+#' Key behaviour and assumptions:
+#'  - Expects dmodel to be an sf object with a POINT geometry column.
+#'  - Expects year-specific raster objects (raster_results_23 / raster_results_24)
+#'    that contain distance-to-harvest and distance-to-nest layers (e.g. DistHarvest,
+#'    DistNest) and harvest buffers (harvest50_buffer, harvest200_buffer).
+#'  - Expects env_stack_10m to be a terra SpatRaster or SpatRaster collection of
+#'    additional covariates for prediction.
+#'  - Uses mgcv::bam() for scalable GAM fitting (discrete = TRUE).
+#'  - Produces partial-effect curves for DistHarvest (excluding spatial+ID random
+#'    effects) and relative-selection (RS = exp(centered link)).
+#'  - Calls maps_by_sex_all_periods(...) (project-specific helper) to produce
+#'    spatial prediction rasters/plots by sex × harvest period.
+#'
+#' @param dmodel sf data.frame with model points (must include Year, geometry, ID, etc.)
+#' @param pred_grid data.frame or sf object of prediction locations (must be convertible to sf)
+#' @param study_region sf polygon of the study area (used downstream in mapping)
+#' @param env_stack_10m terra SpatRaster of 10m environmental covariates
+#' @param raster_results_23 list-like object for 2023 rasters (must include $raster_stack, $harvest50_buffer, $harvest200_buffer)
+#' @param raster_results_24 list-like object for 2024 rasters (same structure as for 2023)
+#' @param pars_to_use named list (must include $Year; value "2023" or "2024")
+#' @param response_col string name of column in dmodel to use as binary response (default "used")
+#' @param nBasis integer upper-bound for k in the 2D spatial smooth (default 150; reduced heuristically)
+#' @param nthreads integer; number of threads passed to mgcv::bam (default 1)
+#'
+#' @return A list containing:
+#'   - method: "gam"
+#'   - parameters: the pars_to_use passed in
+#'   - model: the fitted mgcv::bam object
+#'   - model_data: data.frame used in the fit (with x,y coords and response)
+#'   - model_sf: cleaned sf used for modeling (with covariates)
+#'   - pred_grid_env: prediction grid with extracted covariates
+#'   - dist_harvest_effect_plot: ggplot object of predicted probability vs DistHarvest
+#'   - rel_selection_plot: ggplot object of relative selection vs DistHarvest
+#'   - res_all: output of maps_by_sex_all_periods(...) (spatial predictions & plots)
+#'
+#' @keywords habitat selection GAM prediction
+#' @export
+fit_predict_habitat_model <- function(
+    dmodel,
+    pred_grid,
+    study_region,
+    env_stack_10m,
+    raster_results_23,
+    raster_results_24,
+    pars_to_use,
+    response_col = "used",
+    nBasis = 150,
+    nthreads = 1
+) {
+  # -------------------------
+  # 0) Check package dependencies
+  # -------------------------
+  pkgs <- c("sf", "terra", "dplyr", "mgcv", "ggplot2", "tidyr")
+  miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(miss)) stop("Install missing packages: ", paste(miss, collapse = ", "))
+
+  `%>%` <- dplyr::`%>%`  # local pipe binding for readability
+
+  # -------------------------
+  # 1) Filter model data for the requested year and deduplicate points
+  #    - Keep one point per unique WKT geometry to avoid accidental duplicates
+  # -------------------------
   model_sf <- dmodel %>%
-    dplyr::filter(
-      sex == pars_to_use$sex,
-      Year == pars_to_use$Year,
-      harvesttimeSK24 == pars_to_use$harvesttimeSK24
+    dplyr::filter(Year == pars_to_use$Year) %>%
+    dplyr::mutate(
+      .rowid = dplyr::row_number(),
+      geom_wkt = sf::st_as_text(geometry)
     ) %>%
-    dplyr::select(-geom_id)%>%
-    dplyr::mutate(geom_wkt = sf::st_as_text(geometry)) %>%
     dplyr::distinct(geom_wkt, .keep_all = TRUE) %>%
     dplyr::select(-geom_wkt)
-  
-  
-  # ==========================================================
-  # 2. Select year-specific harvest raster stack and buffer polygons
-  # ==========================================================
-  # Uses separate harvest layers for 2023 and 2024.
-  #
-  # harvest50_sf / harvest200_sf are built here from the 50m and 200m
-  # harvest buffer polygons (harvest50_buffer, harvest200_buffer),
-  # for both years. Each polygon set has its own indicator column
-  # (harvested50m / harvested200m), = 1L within that buffer. These
-  # are joined to the prediction grid in step 4 to derive
-  # harvested50m / harvested200m for pred_grid_env.
-  
+
+  # -------------------------
+  # 2) Select year-specific raster stack and harvest buffer polygons
+  # -------------------------
   if (pars_to_use$Year == "2023") {
-    
     harvest_stack <- raster_results_23$raster_stack
     harvest_regions <- raster_results_23$harvest50_buffer
     harvest200_regions <- raster_results_23$harvest200_buffer
-    
   } else if (pars_to_use$Year == "2024") {
-    
     harvest_stack <- raster_results_24$raster_stack
     harvest_regions <- raster_results_24$harvest50_buffer
-    harvest200_regions <- raster_results_24$harvest200_buffer
-    
+    harvest200_regions <- raster_results_24$raster200_buffer
+    # NOTE: original code used harvest200_buffer for 2024 as well; if yours is named differently update accordingly
   } else {
-    stop("pars_to_use$Year must be either '2023' or '2024'.")
+    stop("pars_to_use$Year must be '2023' or '2024'.")
   }
-  
-  harvest50_sf <- sf::st_sf(
+
+  # Create a simple sf of harvest polygons (used later for mapping)
+  harvest_regions_sf <- sf::st_sf(
     harvested50m = 1L,
     geometry = harvest_regions,
     crs = sf::st_crs(harvest_regions)
   )
-  
-  harvest200_sf <- sf::st_sf(
-    harvested200m = 1L,
-    geometry = harvest200_regions,
-    crs = sf::st_crs(harvest200_regions)
-  )
-  
-  # ==========================================================
-  # 3. Extract covariates at model points
-  # ==========================================================
-  # Environmental and harvest rasters are extracted at used/random points.
-  # hard_substrate and sediment_substrate are intentionally excluded
-  # from later model covariates.
-  
-  env_values_model <- terra::extract(
-    env_stack_10m,
-    terra::vect(model_sf)
-  ) %>%
-    dplyr::select(-ID)
-  
-  
-  
-  # harvest_values_model <- terra::extract(
-  #   harvest_stack,
-  #   terra::vect(model_sf)
-  # ) %>%
-  #   dplyr::select(
-  #     -ID
-  #   )
-  
-  model_sf <- model_sf %>%
-    # dplyr::select(-dplyr::any_of(c("DistNest", "harvested50m", "harvested200m"))) %>%
-    dplyr::bind_cols(
-      env_values_model
-    )
-  table(model_sf$used, model_sf$harvested50m)
-  if ("harvested200m" %in% names(model_sf)) {
-    table(model_sf$used, model_sf$harvested200m)
-  }
-  # ==========================================================
-  # 4. Extract covariates at prediction grid
-  # ==========================================================
-  # Prediction grid receives the same raster covariates as model points.
-  
-  env_values_pred <- terra::extract(
-    env_stack_10m,
-    terra::vect(pred_grid)
-  ) %>%
-    dplyr::select(-ID) %>%
-    # Drop any harvested50m/harvested200m layers picked up from
-    # env_stack_10m here - these are determined for the prediction
-    # grid via harvest_values_pred below, to avoid duplicate-column
-    # conflicts in the bind_cols() call.
+
+  # Combine harvest distance rasters with environmental rasters
+  # (terra SpatRaster concatenation)
+  allRasts <- c(harvest_stack, env_stack_10m)
+
+  # -------------------------
+  # 3) Extract raster covariates for model points
+  #    - Ensure consistent CRS and that rasters use a projected CRS with meter units
+  # -------------------------
+  r_crs <- terra::crs(allRasts, proj = TRUE)
+  if (is.na(r_crs) || r_crs == "") stop("allRasts has no CRS. Set a projected CRS with meter units.")
+
+  model_sf_r <- sf::st_transform(model_sf, r_crs)
+
+  # terra::extract returns a data.frame with ID column (row number); rename to .rowid for join
+  env_values_model <- terra::extract(allRasts, terra::vect(model_sf_r)) %>%
+    dplyr::rename(.rowid = ID) %>%
     dplyr::select(-dplyr::any_of(c("harvested50m", "harvested200m")))
-  
-  # Ensure prediction grid is sf
+
+  # Remove DistNest column from original sf (will be replaced by raster-extracted values)
+  model_sf <- model_sf %>% dplyr::select(-dplyr::any_of("DistNest"))
+
+  # Join extracted raster covariates back to the model sf using .rowid
+  model_sf <- model_sf %>% dplyr::left_join(env_values_model, by = ".rowid")
+
+  # -------------------------
+  # 4) Extract raster covariates for prediction grid
+  # -------------------------
   pred_grid_sf <- sf::st_as_sf(pred_grid)
-  
-  # --------------------------------------------------------
-  # Extract harvest buffer indicators (harvested50m, harvested200m)
-  # for the prediction grid via spatial join against the buffer
-  # polygons (harvest50_sf, harvest200_sf), built in step 2 from
-  # raster_results_*$harvest50_buffer and $harvest200_buffer.
-  #
-  # A grid cell gets harvested50m = 1 if it intersects harvest50_sf,
-  # and harvested200m = 1 if it intersects harvest200_sf; 0 otherwise.
-  # --------------------------------------------------------
-  
-  join_harvest_indicator <- function(grid_sf, polygons_sf, col_name) {
-    
-    joined <- sf::st_join(
-      grid_sf,
-      polygons_sf[, col_name, drop = FALSE],
-      join = sf::st_intersects,
-      left = TRUE
-    ) %>%
-      sf::st_drop_geometry()
-    
-    dplyr::if_else(
-      is.na(joined[[col_name]]),
-      0L,
-      as.integer(joined[[col_name]])
-    )
+  pred_grid_r  <- sf::st_transform(pred_grid_sf, r_crs)
+  env_values_pred <- terra::extract(allRasts, terra::vect(pred_grid_r)) %>% dplyr::select(-ID)
+  pred_grid_env <- pred_grid_r %>% dplyr::bind_cols(env_values_pred)
+
+  # -------------------------
+  # 5) Prepare modeling dataframe: response, weights, necessary covariates
+  # -------------------------
+  if (!"w" %in% names(model_sf)) model_sf$w <- 1  # default weight
+
+  # Verify response column exists and is binary 0/1 (coerce factor if needed)
+  if (!response_col %in% names(model_sf)) stop("response_col not found in model data")
+  if (is.factor(model_sf[[response_col]])) {
+    model_sf[[response_col]] <- as.numeric(as.character(model_sf[[response_col]]))
   }
-  
-  harvest_values_pred <- tibble::tibble(
-    harvested50m = join_harvest_indicator(pred_grid_sf, harvest50_sf, "harvested50m"),
-    harvested200m = join_harvest_indicator(pred_grid_sf, harvest200_sf, "harvested200m")
-  )
-  
-  distNest_pred <- terra::extract(
-    harvest_stack,
-    terra::vect(pred_grid)
-  ) %>%
-    dplyr::select(-dplyr::any_of(c("ID", "harvested50m", "harvested200m")))
-  
-  # 
-  # harvest_values_model <- sf::st_join(
-  #   model_sf %>%
-  #     dplyr::select(-c(harvested50m)),
-  #   harvest_regions_sf,
-  #   join = sf::st_intersects,
-  #   left = TRUE
-  # ) %>%
-  #   dplyr::mutate(
-  #     harvested50m = dplyr::if_else(
-  #       is.na(harvested50m),
-  #       0L,
-  #       harvested50m
-  #     )
-  #   )
-  
-  pred_grid_env <- pred_grid %>%
-    dplyr::select(-dplyr::any_of(c("harvested50m", "harvested200m"))) %>%
-    dplyr::bind_cols(
-      env_values_pred,
-      harvest_values_pred,
-      distNest_pred
-    )
-  
-  # ==========================================================
-  # 5. Prepare modelling dataframe
-  # ==========================================================
-  # Keep only the variables used in the model and drop incomplete rows.
-  # Response must be binary:
-  #   used/random == 1/0, or equivalent response_col.
-  #
-  # Both harvested50m and harvested200m are retained here (if present)
-  # so that either can be selected as the active harvest covariate
-  # further down, on a per-harvest_vars-entry basis.
-  
+  if (!all(model_sf[[response_col]] %in% c(0, 1))) stop("response_col must contain only 0/1 values")
+
+  # Ensure required predictors exist after extraction
+  need_cols <- c("DistNest", "DistHarvest", "bathymetry")
+  miss_cols <- setdiff(need_cols, names(model_sf))
+  if (length(miss_cols)) stop("Missing predictor(s) in model data after extraction: ", paste(miss_cols, collapse = ", "))
+
+  # Ensure categorical variables exist (create default levels if absent)
+  if (!"sex" %in% names(model_sf)) model_sf$sex <- factor("Unknown")
+  if (!"harvesttimeSK24" %in% names(model_sf)) model_sf$harvesttimeSK24 <- factor("all")
+  if (!"ID" %in% names(model_sf)) model_sf$ID <- factor("all")
+
+  # Select and drop NA rows
   model_sf_clean <- model_sf %>%
-    dplyr::select(
-      ID,
-      Logger_model,
-      dplyr::all_of(response_col),
-      Year,
-      sex,
-      harvesttimeSK24,
-      DistNest,
-      dplyr::any_of(c("harvested50m", "harvested200m")),
-      bathymetry,
-      tareskog,
-      geometry
-    ) %>%
+    dplyr::select(ID, sex, harvesttimeSK24, Year,
+                  dplyr::all_of(response_col),
+                  DistNest, DistHarvest, bathymetry, w, geometry) %>%
     tidyr::drop_na()
-  
+
+  # Normalize weights so that mean(w) == 1 to keep effective sample sizes interpretable
+  model_sf_clean$w <- model_sf_clean$w / mean(model_sf_clean$w)
+
+  # Extract coordinates for spatial smooth
   coords_model <- sf::st_coordinates(model_sf_clean)
-  
-  model_data_base <- model_sf_clean %>%
+
+  model_data <- model_sf_clean %>%
     sf::st_drop_geometry() %>%
     dplyr::mutate(
+      response = .data[[response_col]],
       x = coords_model[, 1],
       y = coords_model[, 2],
-      
-      # Convert response to numeric 0/1.
-      response = as.numeric(as.character(.data[[response_col]])),
-      
-      # Factor variables retained as categorical predictors.
-      Logger_model = factor(Logger_model),
-      # tareskog = factor(tareskog),
-      ID = factor(ID)
+      ID = factor(ID),
+      sex = factor(sex),
+      harvesttimeSK24 = factor(harvesttimeSK24),
+      w = w
     )
-  
-  # Convert harvest buffer variables to factors where present, without
-  # yet committing to one as "the" active covariate.
-  for (hv in intersect(c("harvested50m", "harvested200m"), names(model_data_base))) {
-    model_data_base[[hv]] <- factor(model_data_base[[hv]])
-  }
-  
-  stopifnot(all(model_data_base$response %in% c(0, 1)))
-  
-  # ==========================================================
-  # 6. Scale continuous predictors
-  # ==========================================================
-  # Scaling parameters are estimated from model data only.
-  # This avoids leaking prediction-grid information into model fitting.
-  # These scaling parameters do not depend on which harvest variable
-  # is used, so they are computed once and reused across harvest_vars.
-  
-  dist_center <- mean(model_data_base$DistNest, na.rm = TRUE)
-  dist_scale <- sd(model_data_base$DistNest, na.rm = TRUE)
-  
-  bathy_center <- mean(model_data_base$bathymetry, na.rm = TRUE)
-  bathy_scale <- sd(model_data_base$bathymetry, na.rm = TRUE)
-  
-  x_center <- mean(model_data_base$x, na.rm = TRUE)
-  x_scale <- sd(model_data_base$x, na.rm = TRUE)
-  
-  y_center <- mean(model_data_base$y, na.rm = TRUE)
-  y_scale <- sd(model_data_base$y, na.rm = TRUE)
-  
-  model_data_base <- model_data_base %>%
+
+  # -------------------------
+  # 6) Fit GAM
+  #    - Uses a spatial thin-plate spline s(x,y)
+  #    - Includes random effect for ID (s(ID, bs="re"))
+  #    - Interactions of DistHarvest with sex and harvesttimeSK24
+  # -------------------------
+  # Heuristic for k: at most nBasis but with a minimum relative to sample size
+  nBasis <- min(nBasis, max(40, round(nrow(model_data) / 30)))
+
+  fitted_model <- mgcv::bam(
+    response ~
+      s(DistNest, k = 5) +
+      DistHarvest * sex +
+      DistHarvest * harvesttimeSK24 +
+      s(bathymetry, k = 5) +
+      s(ID, bs = "re") +                 # random effect per ID (cheap & interpretable)
+      s(x, y, bs = "tp", k = nBasis),
+    data     = model_data,
+    family   = binomial(),
+    weights  = w,
+    method   = "fREML",
+    discrete = TRUE,        # speeds up fitting on large datasets
+    nthreads = nthreads,    # threading control for bam
+    gc.level = 2            # more aggressive memory management during fit
+  )
+
+  # -------------------------
+  # 7) Partial effect curves for DistHarvest (exclude spatial & ID random effects)
+  # -------------------------
+  .med <- function(x) if (is.numeric(x)) stats::median(x, na.rm = TRUE) else x[1]
+
+  # Build list of smooth labels to exclude spatial and ID terms from partial predictions
+  smooth_labels <- vapply(fitted_model$smooth, function(sm) sm$label, character(1))
+  exclude_terms <- smooth_labels[
+    startsWith(smooth_labels, "s(x,y") | startsWith(smooth_labels, "s(ID)")
+  ]
+
+  # Use the central 2..98% quantiles of DistHarvest for effect plotting
+  qDH    <- stats::quantile(model_data$DistHarvest, c(0.02, 0.98), na.rm = TRUE)
+  DH_seq <- seq(qDH[1], qDH[2], length.out = 150)
+
+  # Base covariate row: hold other covariates at typical values
+  base_row <- data.frame(
+    DistNest    = .med(model_data$DistNest),
+    bathymetry  = .med(model_data$bathymetry),
+    x           = .med(model_data$x),
+    y           = .med(model_data$y),
+    ID          = model_data$ID[1]
+  )
+
+  # Expand base_row across DistHarvest, sexes, and harvesttimeSK24 levels
+  lev_period <- levels(model_data$harvesttimeSK24)
+  lev_sex    <- levels(model_data$sex)
+
+  effect_grid <- do.call(rbind, lapply(lev_sex, function(sx) {
+    do.call(rbind, lapply(lev_period, function(pr) {
+      nd <- base_row[rep(1, length(DH_seq)), , drop = FALSE]
+      nd$DistHarvest     <- DH_seq
+      nd$harvesttimeSK24 <- factor(pr, levels = lev_period)
+      nd$sex             <- factor(sx, levels = lev_sex)
+      nd
+    }))
+  }))
+  row.names(effect_grid) <- NULL
+
+  # Predict on the link scale excluding spatial & ID random effects
+  pred_link <- predict(
+    fitted_model,
+    newdata = effect_grid,
+    type    = "link",
+    se.fit  = TRUE,
+    exclude = exclude_terms
+  )
+
+  effect_grid$eta  <- as.numeric(pred_link$fit)
+  effect_grid$se   <- as.numeric(pred_link$se.fit)
+  effect_grid$p    <- stats::plogis(effect_grid$eta)
+  effect_grid$p_lo <- stats::plogis(effect_grid$eta - 1.96 * effect_grid$se)
+  effect_grid$p_hi <- stats::plogis(effect_grid$eta + 1.96 * effect_grid$se)
+
+  # Center the link by sex × harvest period and compute Relative Selection (RS)
+  effect_grid <- effect_grid %>%
+    dplyr::group_by(sex, harvesttimeSK24) %>%
     dplyr::mutate(
-      DistNest_sc = as.numeric((DistNest - dist_center) / dist_scale),
-      bathymetry_sc = as.numeric((bathymetry - bathy_center) / bathy_scale),
-      
-      # Coordinate scaling for MaxEnt and biomod spatial trend terms.
-      x_sc = as.numeric((x - x_center) / x_scale),
-      y_sc = as.numeric((y - y_center) / y_scale),
-      x2 = x_sc^2,
-      y2 = y_sc^2,
-      xy = x_sc * y_sc
-    )
-  
-  # ==========================================================
-  # 7. Individual ID effect variables
-  # ==========================================================
-  # GAM uses s(ID, bs = "re").
-  # MaxEnt and biomod cannot fit random effects directly, so ID is
-  # represented using dummy variables during fitting.
-  #
-  # For population-level prediction, all ID dummy variables are set to 0.
-  # ID dummies do not depend on harvest_vars, so computed once.
-  
-  id_dummy_model <- stats::model.matrix(~ ID - 1, data = model_data_base)
-  colnames(id_dummy_model) <- make.names(colnames(id_dummy_model))
-  
-  model_data_base <- dplyr::bind_cols(
-    model_data_base,
-    as.data.frame(id_dummy_model)
-  )
-  
-  id_dummy_cols <- colnames(id_dummy_model)
-  
-  # ==========================================================
-  # 8. Spatial block cross-validation
-  # ==========================================================
-  # Spatial blocks are created once and reused for ALL harvest_vars
-  # entries and all model types, so that the same fold assignment
-  # applies regardless of which harvest covariate is used.
-  
-  cat("Creating spatial blocks...\n")
-  
-  model_sf_cv <- sf::st_as_sf(
-    model_data_base,
-    coords = c("x", "y"),
-    crs = sf::st_crs(study_region),
-    remove = FALSE
-  )
-  
-  set.seed(seed)
-  
-  spatial_blocks <- blockCV::cv_spatial(
-    x = model_sf_cv,
-    column = "response",
-    r = env_stack_10m,
-    #size = block_size_m,
-    k = n_cv_folds,
-    selection = "random",
-    iteration = 100
-  )
-  
-  model_data_base$fold <- spatial_blocks$folds_ids
-  
-  # biomod2 expects:
-  #   TRUE  = training/calibration
-  #   FALSE = testing/evaluation
-  cv_table <- sapply(seq_len(n_cv_folds), function(k) {
-    model_data_base$fold != k
-  })
-  
-  colnames(cv_table) <- paste0("_allData_RUN", seq_len(n_cv_folds))
-  cv_table <- as.data.frame(cv_table)
-  
-  # ==========================================================
-  # 9-17. Fit + predict + plot, once per harvest_vars entry
-  # ==========================================================
-  # The block below was previously a single fit/predict/plot section.
-  # It is now wrapped in a loop so it runs once per harvest variable
-  # (e.g. "harvested50m", then "harvested200m"), with each iteration
-  # producing its own fitted model, predictions, and plots. The
-  # harvest variable used in that iteration is referred to generically
-  # as `harvest_var_active` inside the loop, and the model formula /
-  # predictor sets reference that column directly (internally renamed
-  # to `harvest_var`).
-  
-  results_by_harvest <- list()
-  
-  for (harvest_var_active in harvest_vars) {
-    
-    cat("=== Fitting", method, "model using harvest variable:",
-        harvest_var_active, "===\n")
-    
-    if (!harvest_var_active %in% names(model_data_base)) {
-      warning(
-        paste0(
-          "Harvest variable '", harvest_var_active,
-          "' not found in model data; skipping this run."
-        )
-      )
-      next
-    }
-    
-    if (!harvest_var_active %in% names(pred_grid_env)) {
-      warning(
-        paste0(
-          "Harvest variable '", harvest_var_active,
-          "' not found in pred_grid_env; skipping this run."
-        )
-      )
-      next
-    }
-    
-    # ----------------------------------------------------------
-    # Per-iteration model_data: rename the active harvest variable
-    # to a fixed internal name 'harvest_var' so the rest of the
-    # fitting / prediction code does not need to branch on names.
-    # ----------------------------------------------------------
-    
-    model_data <- model_data_base %>%
-      dplyr::rename(harvest_var = dplyr::all_of(harvest_var_active))
-    
-    block_eval <- NULL
-    ensemble_model <- NULL
-    biomod_pred_data <- NULL
-    fitted_model <- NULL
-    
-    if (method == "gam") {
-      
-      # --------------------------------------------------------
-      # GAM
-      # --------------------------------------------------------
-      # Includes:
-      #   - harvest effect (harvest_var_active)
-      #   - distance to nest
-      #   - bathymetry
-      #   - tareskog
-      #   - spatial smooth
-      #   - individual random effect
-      
-      fitted_model <- mgcv::gam(
-        response ~
-          harvest_var +
-          DistNest_sc +
-          bathymetry_sc +
-          s(ID, bs = "re")+
-          s(x, y, bs = "tp", k = nBasis) ,
-        data = model_data,
-        family = binomial,
-        method = "REML"
-      )
-      
-      # Fold-wise spatial-block evaluation.
-      block_eval <- purrr::map_dfr(seq_len(n_cv_folds), function(k) {
-        
-        train_dat <- model_data[model_data$fold != k, ]
-        test_dat <- model_data[model_data$fold == k, ]
-        
-        m_k <- mgcv::gam(
-          response ~
-            harvest_var +
-            DistNest_sc +
-            bathymetry_sc +
-            tareskog +
-            s(x, y, bs = "tp", k = nBasis) +
-            s(ID, bs = "re"),
-          data = train_dat,
-          family = binomial,
-          method = "REML"
-        )
-        
-        # Exclude ID random effect for population-level validation prediction.
-        test_dat$pred <- predict(
-          m_k,
-          newdata = test_dat,
-          type = "response",
-          exclude = "s(ID)"
-        )
-        
-        test_dat$cv_fold <- k
-        test_dat
-      })
-      
-    } else if (method == "maxent") {
-      
-      # --------------------------------------------------------
-      # MaxEnt via maxnet
-      # --------------------------------------------------------
-      # Includes ID dummy variables during fitting.
-      # During prediction, these are set to 0.
-      
-      maxent_predictors <- model_data %>%
-        dplyr::select(
-          DistNest_sc,
-          bathymetry_sc,
-          harvest_var,
-          tareskog,
-          x_sc,
-          y_sc,
-          x2,
-          y2,
-          xy,
-          dplyr::all_of(id_dummy_cols)
-        )
-      
-      fitted_model <- maxnet::maxnet(
-        p = model_data$response,
-        data = maxent_predictors,
-        regmult = 0.01,
-        f = maxnet::maxnet.formula(
-          p = model_data$response,
-          data = maxent_predictors,
-          classes = "l"
-        )
-      )
-      
-      block_eval <- purrr::map_dfr(seq_len(n_cv_folds), function(k) {
-        
-        train_dat <- model_data[model_data$fold != k, ]
-        test_dat <- model_data[model_data$fold == k, ]
-        
-        train_x <- train_dat %>%
-          dplyr::select(
-            DistNest_sc,
-            bathymetry_sc,
-            harvest_var,
-            tareskog,
-            x_sc,
-            y_sc,
-            x2,
-            y2,
-            xy,
-            dplyr::all_of(id_dummy_cols)
-          )
-        
-        test_x <- test_dat %>%
-          dplyr::select(
-            DistNest_sc,
-            bathymetry_sc,
-            harvest_var,
-            tareskog,
-            x_sc,
-            y_sc,
-            x2,
-            y2,
-            xy,
-            dplyr::all_of(id_dummy_cols)
-          )
-        
-        m_k <- maxnet::maxnet(
-          p = train_dat$response,
-          data = train_x,
-          regmult = 0.01,
-          f = maxnet::maxnet.formula(
-            p = train_dat$response,
-            data = train_x,
-            classes = "l"
-          )
-        )
-        
-        # Remove ID effect from validation prediction.
-        for (id_col in id_dummy_cols) {
-          test_x[[id_col]] <- 0
-        }
-        
-        test_dat$pred <- as.numeric(
-          predict(
-            m_k,
-            newdata = test_x,
-            type = "cloglog"
-          )
-        )
-        
-        test_dat$cv_fold <- k
-        test_dat
-      })
-      
-    } else if (method == "ensemble") {
-      
-      # --------------------------------------------------------
-      # biomod2 ensemble
-      # --------------------------------------------------------
-      # Uses:
-      #   - MAXNET
-      #   - GAM
-      #   - RF
-      #   - GBM
-      #
-      # Uses the same spatial-block CV table as other methods.
-      # Includes ID dummy variables during fitting.
-      
-      biomod_df <- model_data %>%
-        dplyr::mutate(
-          response = as.integer(response),
-          harvest_var = as.numeric(as.character(harvest_var)),
-          tareskog = as.numeric(as.character(tareskog))
-        ) %>%
-        dplyr::select(
-          response,
-          DistNest_sc,
-          bathymetry_sc,
-          harvest_var,
-          tareskog,
-          x,
-          y,
-          x_sc,
-          y_sc,
-          x2,
-          y2,
-          xy,
-          fold,
-          dplyr::all_of(id_dummy_cols)
-        ) %>%
-        tidyr::drop_na()
-      
-      biomod_cv_table <- sapply(seq_len(n_cv_folds), function(k) {
-        biomod_df$fold != k
-      })
-      
-      colnames(biomod_cv_table) <- paste0("_allData_RUN", seq_len(n_cv_folds))
-      
-      biomod_cv_table <- as.data.frame(biomod_cv_table)
-      biomod_cv_table[] <- lapply(biomod_cv_table, as.logical)
-      
-      stopifnot(nrow(biomod_cv_table) == nrow(biomod_df))
-      stopifnot(!anyNA(biomod_cv_table))
-      
-      # biomod2 writes model files to working directory.
-      # Use a temporary directory so repeated runs do not overwrite project files.
-      
-      tmp_dir <- tempfile(pattern = "biomod_")
-      dir.create(tmp_dir, recursive = TRUE)
-      
-      old_wd <- getwd()
-      setwd(tmp_dir)
-      
-      on.exit({
-        setwd(old_wd)
-        if (dir.exists(tmp_dir)) {
-          unlink(tmp_dir, recursive = TRUE, force = TRUE)
-        }
-      }, add = TRUE)
-      
-      biomod_expl_vars <- biomod_df %>%
-        dplyr::select(
-          DistNest_sc,
-          bathymetry_sc,
-          tareskog,
-          harvest_var,
-          x_sc,
-          y_sc,
-          x2,
-          y2,
-          xy,
-          dplyr::all_of(id_dummy_cols)
-        )
-      
-      biomod_data <- biomod2::BIOMOD_FormatingData(
-        resp.var = biomod_df$response,
-        expl.var = biomod_expl_vars,
-        resp.xy = biomod_df %>%
-          dplyr::select(x, y),
-        resp.name = "habitat.model"
-      )
-      
-      biomod_options <- biomod2::bm_ModelingOptions(
-        models = c("MAXNET", "GAM", "RF", "GBM"),
-        strategy = "user.defined",
-        user.val = list(
-          MAXNET = list(
-            "_allData_allRun" = list(
-              feature_classes = "l",
-              regmult = 0.01
-            )
-          ),
-          GAM = list(
-            "_allData_allRun" = list(
-              algo = "GAM_mgcv",
-              family = binomial(link = "logit"),
-              method = "REML",
-              select = TRUE
-            )
-          ),
-          RF = list(
-            "_allData_allRun" = list(
-              ntree = 150,
-              importance = TRUE
-            )
-          ),
-          GBM = list(
-            "_allData_allRun" = list(
-              n.trees = 250,
-              interaction.depth = 3,
-              shrinkage = 0.01,
-              bag.fraction = 0.5
-            )
-          )
-        )
-      )
-      
-      fitted_model <- biomod2::BIOMOD_Modeling(
-        bm.format = biomod_data,
-        models = c("MAXNET", "GAM", "RF", "GBM"),
-        OPT.user.val = biomod_options,
-        
-        CV.strategy = "user.defined",
-        CV.user.table = biomod_cv_table,
-        CV.do.full.models = FALSE,
-        
-        metric.eval = c("AUCroc", "TSS"),
-        var.import = 0,
-        nb.cpu = 1,
-        modeling.id = paste0("ensemble_model_block_cv_", harvest_var_active)
-      )
-      
-      ensemble_model <- biomod2::BIOMOD_EnsembleModeling(
-        bm.mod = fitted_model,
-        em.by = "all",
-        em.algo = c("EMmean", "EMwmean"),
-        metric.select = "AUCroc",
-        metric.select.thresh = 0.7,
-        metric.eval = c("AUCroc", "TSS")
-      )
-      
-      block_eval <- biomod_df
-    }
-    
-    # ==========================================================
-    # Prepare prediction dataframe
-    # ==========================================================
-    # Prediction data receive same scaling as model data.
-    # ID is assigned a valid factor level, but ID effect is excluded later.
-    # The active harvest variable is renamed to 'harvest_var' to match
-    # the model_data used for fitting.
-    
-    cat("Preparing prediction data...\n")
-    
-    coords_pred <- sf::st_coordinates(pred_grid_env)
-    
-    pred_df <- pred_grid_env %>%
-      sf::st_drop_geometry() %>%
-      dplyr::rename(harvest_var = dplyr::all_of(harvest_var_active)) %>%
-      dplyr::mutate(
-        x = coords_pred[, 1],
-        y = coords_pred[, 2],
-        harvest_var = factor(harvest_var, levels = levels(model_data$harvest_var)),
-        tareskog = factor(tareskog, levels = levels(model_data$tareskog)),
-        ID = factor(levels(model_data$ID)[1], levels = levels(model_data$ID)),
-        DistNest_sc = as.numeric((DistNest - dist_center) / dist_scale),
-        bathymetry_sc = as.numeric((bathymetry - bathy_center) / bathy_scale),
-        x_sc = as.numeric((x - x_center) / x_scale),
-        y_sc = as.numeric((y - y_center) / y_scale),
-        x2 = x_sc^2,
-        y2 = y_sc^2,
-        xy = x_sc * y_sc
-      )
-    
-    # ==========================================================
-    # Predict without individual ID effects
-    # ==========================================================
-    
-    cat("Running predictions...\n")
-    
-    if (method == "gam") {
-      
-      pred_df$pred_prob <- predict(
-        fitted_model,
-        newdata = pred_df,
-        type = "response",
-        exclude = "s(ID)"
-      )
-      
-    } else if (method == "maxent") {
-      
-      maxent_pred_data <- pred_df %>%
-        dplyr::select(
-          DistNest_sc,
-          bathymetry_sc,
-          harvest_var,
-          tareskog,
-          x_sc,
-          y_sc,
-          x2,
-          y2,
-          xy
-        ) %>%
-        as.data.frame()
-      
-      for (id_col in id_dummy_cols) {
-        maxent_pred_data[[id_col]] <- 0
-      }
-      
-      pred_df$pred_prob <- as.numeric(
-        predict(
-          fitted_model,
-          newdata = maxent_pred_data,
-          type = "cloglog"
-        )
-      )
-      
-    } else if (method == "ensemble") {
-      
-      biomod_pred_data <- pred_df %>%
-        dplyr::mutate(
-          harvest_var = as.numeric(as.character(harvest_var)),
-          tareskog = as.numeric(as.character(tareskog))
-        ) %>%
-        dplyr::select(
-          DistNest_sc,
-          bathymetry_sc,
-          tareskog,
-          harvest_var,
-          x_sc,
-          y_sc,
-          x2,
-          y2,
-          xy
-        ) %>%
-        as.data.frame()
-      
-      for (id_col in id_dummy_cols) {
-        biomod_pred_data[[id_col]] <- 0
-      }
-      
-      ensemble_projection <- biomod2::BIOMOD_EnsembleForecasting(
-        bm.em = ensemble_model,
-        new.env = biomod_pred_data,
-        proj.name = paste0("current_projection_", harvest_var_active)
-      )
-      
-      pred_vals <- biomod2::get_predictions(ensemble_projection)
-      
-      pred_vals_one <- pred_vals %>%
-        dplyr::filter(algo == "EMwmean") %>%
-        dplyr::arrange(points)
-      
-      pred_df$pred_prob <- pred_vals_one$pred / 1000
-    }
-    
-    # ==========================================================
-    # Rasterise predictions and mask to kelp habitat
-    # ==========================================================
-    # Predictions are restricted to:
-    #   - study_region
-    #   - tareskog == 1
-    
-    pred_raster <- terra::rast(
-      pred_df[, c("x", "y", "pred_prob")],
-      type = "xyz",
-      crs = sf::st_crs(study_region)$wkt
-    )
-    
-    names(pred_raster) <- "pred_prob"
-    
-    tareskog_mask <- env_stack_10m[["tareskog"]] == 1
-    
-    tareskog_mask <- terra::resample(
-      tareskog_mask,
-      pred_raster,
-      method = "near"
-    )
-    
-    pred_raster <- terra::mask(
-      pred_raster,
-      tareskog_mask,
-      maskvalues = 0
-    )
-    
-    pred_raster <- terra::crop(
-      pred_raster,
-      terra::vect(study_region)
-    )
-    
-    pred_raster <- terra::mask(
-      pred_raster,
-      terra::vect(study_region)
-    )
-    
-    # ==========================================================
-    # Prepare harvested polygons
-    # ==========================================================
-    # Use the buffer polygon matching the active harvest variable
-    # for this iteration's plot outline (harvest50_buffer for
-    # harvested50m, harvest200_buffer for harvested200m; falls back
-    # to harvest_regions/50m buffer for any other harvest variable).
-    
-    harvest_polygons_active <- switch(
-      harvest_var_active,
-      harvested50m = harvest_regions,
-      harvested200m = harvest200_regions,
-      harvest_regions
-    )
-    
-    harvest_regions_sf_run <- sf::st_as_sf(harvest_polygons_active)
-    
-    if (sf::st_crs(harvest_regions_sf_run) != sf::st_crs(study_region)) {
-      harvest_regions_sf_run <- sf::st_transform(
-        harvest_regions_sf_run,
-        sf::st_crs(study_region)
-      )
-    }
-    
-    harvest_regions_sf_run <- sf::st_intersection(
-      harvest_regions_sf_run,
-      sf::st_union(study_region)
-    )
-    
-    # ==========================================================
-    # Prediction plot
-    # ==========================================================
-    # Plot contains:
-    #   - masked predicted suitability raster
-    #   - harvested polygons
-    #   - used/random model points
-    #   - study-region boundary
-    
-    pred_df_plot <- terra::as.data.frame(
-      pred_raster,
-      xy = TRUE,
-      na.rm = TRUE
-    )
-    
-    names(pred_df_plot)[3] <- "pred_prob"
-    
-    points_plot <- model_sf_clean %>%
-      dplyr::mutate(
-        point_type = dplyr::case_when(
-          .data[[response_col]] == 1 ~ "Used",
-          .data[[response_col]] == 0 ~ "Random",
-          TRUE ~ NA_character_
-        )
-      )
-    
-    prediction_plot <- ggplot2::ggplot() +
-      ggplot2::geom_raster(
-        data = pred_df_plot,
-        ggplot2::aes(x = x, y = y, fill = pred_prob)
-      ) +
-      ggplot2::geom_sf(
-        data = harvest_regions_sf_run,
-        fill = NA,
-        color = "red",
-        linewidth = 0.7
-      ) +
-      ggplot2::geom_sf(
-        data = points_plot,
-        ggplot2::aes(color = point_type),
-        size = 0.3,
-        alpha = 0.1
-      ) +
-      ggplot2::geom_sf(
-        data = study_region,
-        fill = NA,
-        color = "black",
-        linewidth = 0.4
-      ) +
-      ggplot2::coord_sf(crs = sf::st_crs(study_region)) +
-      ggplot2::scale_fill_viridis_c(
-        name = "Predicted probability",
-        na.value = NA
-      ) +
-      ggplot2::scale_color_manual(
-        name = "Point type",
-        values = c(
-          "Used" = "black",
-          "Random" = "grey60"
-        )
-      ) +
-      ggplot2::labs(
-        title = paste("Predicted habitat suitability:", toupper(method)),
-        subtitle = paste(
-          pars_to_use$Year,
-          pars_to_use$sex,
-          pars_to_use$harvesttimeSK24,
-          "| harvest var:", harvest_var_active,
-          "| masked to tareskog == 1"
-        ),
-        x = "Easting",
-        y = "Northing"
-      ) +
-      ggplot2::theme_minimal()
-    
-    # ==========================================================
-    # Optional diagnostics
-    # ==========================================================
-    
-    model_checks <- NULL
-    
-    if (checks && method == "gam") {
-      model_checks <- list(
-        summary = summary(fitted_model),
-        gam_check = mgcv::gam.check(fitted_model)
-      )
-    }
-    
-    # ==========================================================
-    # Optional ensemble harvest-effect plot
-    # ==========================================================
-    
-    harvest_conditional_plot <- NULL
-    
-    if (method == "ensemble") {
-      
-      newdat0 <- biomod_pred_data
-      newdat1 <- biomod_pred_data
-      
-      newdat0$harvest_var <- 0
-      newdat1$harvest_var <- 1
-      
-      proj0 <- biomod2::BIOMOD_EnsembleForecasting(
-        bm.em = ensemble_model,
-        new.env = newdat0,
-        proj.name = paste0("harvest0_", harvest_var_active)
-      )
-      
-      proj1 <- biomod2::BIOMOD_EnsembleForecasting(
-        bm.em = ensemble_model,
-        new.env = newdat1,
-        proj.name = paste0("harvest1_", harvest_var_active)
-      )
-      
-      pred0 <- biomod2::get_predictions(proj0) %>%
-        dplyr::filter(algo == "EMwmean") %>%
-        dplyr::arrange(points)
-      
-      pred1 <- biomod2::get_predictions(proj1) %>%
-        dplyr::filter(algo == "EMwmean") %>%
-        dplyr::arrange(points)
-      
-      effect_df <- data.frame(
-        x = pred_df$x,
-        y = pred_df$y,
-        no_harvest = pred0$pred / 1000,
-        harvest = pred1$pred / 1000
-      )
-      
-      effect_df$delta <- effect_df$harvest - effect_df$no_harvest
-      
-      delta_raster <- terra::rast(
-        effect_df[, c("x", "y", "delta")],
-        type = "xyz",
-        crs = sf::st_crs(study_region)$wkt
-      )
-      
-      delta_raster <- terra::mask(
-        delta_raster,
-        tareskog_mask,
-        maskvalues = 0
-      )
-      
-      delta_raster <- terra::crop(
-        delta_raster,
-        terra::vect(study_region)
-      )
-      
-      delta_raster <- terra::mask(
-        delta_raster,
-        terra::vect(study_region)
-      )
-      
-      delta_df <- terra::as.data.frame(
-        delta_raster,
-        xy = TRUE,
-        na.rm = TRUE
-      )
-      
-      harvest_conditional_plot <- ggplot2::ggplot() +
-        ggplot2::geom_raster(
-          data = delta_df,
-          ggplot2::aes(x = x, y = y, fill = delta)
-        ) +
-        ggplot2::geom_sf(
-          data = harvest_regions_sf_run,
-          fill = NA,
-          color = "red",
-          linewidth = 0.7
-        ) +
-        ggplot2::geom_sf(
-          data = points_plot,
-          ggplot2::aes(color = point_type),
-          size = 0.7,
-          alpha = 0.25
-        ) +
-        ggplot2::geom_sf(
-          data = study_region,
-          fill = NA,
-          color = "black",
-          linewidth = 0.4
-        ) +
-        ggplot2::coord_sf(crs = sf::st_crs(study_region)) +
-        ggplot2::scale_fill_viridis_c(
-          name = "Harvest effect\nΔ suitability",
-          option = "magma"
-        ) +
-        ggplot2::scale_color_manual(
-          name = "Point type",
-          values = c(
-            "Used" = "black",
-            "Random" = "grey60"
-          )
-        ) +
-        ggplot2::theme_minimal()
-    }
-    
-    # ==========================================================
-    # Assemble per-harvest-variable result object
-    # ==========================================================
-    # 'model_data' and 'pred_df' below retain the internal column
-    # 'harvest_var'; for clarity, a copy of the active harvest
-    # variable name is also stored under 'harvest_var_name'.
-    
-    results_by_harvest[[harvest_var_active]] <- list(
-      method = method,
-      harvest_var_name = harvest_var_active,
-      parameters = pars_to_use,
-      seed = seed,
-      
-      model = fitted_model,
-      ensemble_model = ensemble_model,
-      
-      model_data = model_data,
-      model_sf = model_sf,
-      model_sf_clean = model_sf_clean,
-      
-      pred_grid_env = pred_grid_env,
-      pred_df = pred_df,
-      pred_raster = pred_raster,
-      
-      harvest_regions = harvest_regions_sf_run,
-      plot = prediction_plot,
-      harvest_conditional_plot = harvest_conditional_plot,
-      
-      checks = model_checks,
-      
-      spatial_blocks = spatial_blocks,
-      cv_table = cv_table,
-      block_eval = block_eval,
-      block_size_m = block_size_m,
-      n_cv_folds = n_cv_folds,
-      
-      scaling = list(
-        DistNest = c(center = dist_center, scale = dist_scale),
-        bathymetry = c(center = bathy_center, scale = bathy_scale),
-        x = c(center = x_center, scale = x_scale),
-        y = c(center = y_center, scale = y_scale)
-      ),
-      
-      id_dummy_cols = id_dummy_cols,
-      biomod_pred_data = biomod_pred_data
-    )
-    
-  } # end loop over harvest_vars
-  
-  cat("Returning results for harvest variables:",
-      paste(names(results_by_harvest), collapse = ", "), "\n")
-  
-  return(results_by_harvest)
-}
+      eta_ctr = eta - mean(eta, na.rm = TRUE),
+      RS = exp(eta_ctr)
+    ) %>%
+    dplyr::ungroup()
 
+  # -------------------------
+  # 8) Plotting: partial probability and RS
+  # -------------------------
+  dist_harvest_effect_plot <- ggplot2::ggplot(
+    effect_grid,
+    ggplot2::aes(x = DistHarvest, y = p, color = harvesttimeSK24, fill = harvesttimeSK24)
+  ) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = p_lo, ymax = p_hi), alpha = 0.15, color = NA) +
+    ggplot2::geom_line(size = 1) +
+    ggplot2::facet_wrap(~ sex, nrow = 1) +
+    ggplot2::labs(
+      title = paste("Partial effect of distance to harvest for year:", pars_to_use$Year),
+      subtitle = "Predicted probability; excluding s(x,y) and s(ID)",
+      x = "Distance to harvest",
+      y = "Predicted probability"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::scale_color_brewer(palette = "Dark2") +
+    ggplot2::scale_fill_brewer(palette = "Dark2")
 
-# ============================================================
-# Save habitat modelling outputs
-# ============================================================
-# save_habitat_results now expects either:
-#   - a single result list (as previously returned by
-#     fit_predict_habitat_model for one harvest variable), OR
-#   - the new named list of result lists returned by
-#     fit_predict_habitat_model (one entry per harvest_vars
-#     element, e.g. results[["harvested50m"]], results[["harvested200m"]]).
-#
-# If a named list of result lists is passed (i.e. `results` does not
-# itself contain a "method" element but its elements do), this function
-# loops over each entry and saves outputs with a harvest-variable-specific
-# prefix (e.g. "habitat_model_harvested50m_...",
-# "habitat_model_harvested200m_...").
+  rel_selection_plot <- ggplot2::ggplot(
+    effect_grid,
+    ggplot2::aes(x = DistHarvest, y = RS, color = harvesttimeSK24)
+  ) +
+    ggplot2::geom_line(size = 1) +
+    ggplot2::facet_wrap(~ sex, nrow = 1) +
+    ggplot2::labs(
+      title = "Relative selection vs. distance to harvest",
+      subtitle = "RS = exp(centered link); excluding s(x,y) and s(ID)",
+      x = "Distance to harvest",
+      y = "Relative selection (RS)"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::scale_color_brewer(palette = "Dark2")
 
-save_habitat_results <- function(results,
-                                 out_dir,
-                                 prefix = "habitat_model") {
-  
-  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  
-  # ----------------------------------------------------------
-  # Detect whether `results` is a single result object or a
-  # named list of result objects (one per harvest variable).
-  # ----------------------------------------------------------
-  
-  is_single_result <- "method" %in% names(results) && "model" %in% names(results)
-  
-  if (!is_single_result) {
-    
-    saved_files_all <- list()
-    
-    for (harvest_var_name in names(results)) {
-      
-      sub_prefix <- paste0(prefix, "_", harvest_var_name)
-      
-      saved_files_all[[harvest_var_name]] <- save_habitat_results(
-        results = results[[harvest_var_name]],
-        out_dir = out_dir,
-        prefix = sub_prefix
-      )
-    }
-    
-    return(saved_files_all)
-  }
-  
-  # ----------------------------------------------------------
-  # 1. Save full result object
-  # ----------------------------------------------------------
-  
-  save(
-    results,
-    file = file.path(out_dir, paste0(prefix, "_full_results.RData"))
+  # -------------------------
+  # 9) Generate spatial predictions & plots by sex × harvest period
+  #    - maps_by_sex_all_periods(...) is a project-specific helper that should:
+  #       * accept the fitted model, model_data, and pred_grid_env
+  #       * return a list containing spatial prediction rasters and plot objects
+  #    - Here we pass response_col = "random" in original code; adjust if necessary.
+  # -------------------------
+  res_all <- maps_by_sex_all_periods(
+    fitted_model     = fitted_model,
+    model_data       = model_data,
+    pred_grid_env    = pred_grid_env,
+    study_region     = study_region,
+    harvest_polygons = harvest_regions_sf,
+    env_stack_10m    = env_stack_10m,
+    response_col     = "random",   # keep consistent with upstream usage; change to response_col if desired
+    point_labels     = c("0" = "random = 0", "1" = "random = 1"),
+    exclude_re       = TRUE
   )
-  
-  
-  # ----------------------------------------------------------
-  # 2. Save core model objects
-  # ----------------------------------------------------------
-  
-  method     <- results$method
-  parameters <- results$parameters
-  model      <- results$model
-  checks     <- results$checks
-  spatial_blocks <- results$spatial_blocks
-  cv_table <- results$cv_table
-  block_eval <- results$block_eval
-  block_size_m <- results$block_size_m
-  n_cv_folds <- results$n_cv_folds
-  
-  save(
-    method,
-    parameters,
-    model,
-    checks,
-    spatial_blocks,
-    cv_table,
-    block_eval,
-    block_size_m,
-    n_cv_folds,
-    file = file.path(out_dir, paste0(prefix, "_model_objects.RData"))
+
+  # -------------------------
+  # 10) Return structured results for downstream saving/plotting
+  # -------------------------
+  list(
+    method = "gam",
+    parameters = pars_to_use,
+    model = fitted_model,
+    model_data = model_data,
+    model_sf = model_sf_clean,
+    pred_grid_env = pred_grid_env,
+    dist_harvest_effect_plot = dist_harvest_effect_plot,
+    rel_selection_plot = rel_selection_plot,
+    res_all = res_all
   )
-  
-  
-  # ----------------------------------------------------------
-  # 3. Save ordinary dataframes
-  # ----------------------------------------------------------
-  
-  model_data <- results$model_data
-  pred_df    <- results$pred_df
-  
-  save(
-    model_data,
-    pred_df,
-    file = file.path(out_dir, paste0(prefix, "_dataframes.RData"))
-  )
-  
-  
-  # ----------------------------------------------------------
-  # 4. Helper: save sf objects as parquet using WKT geometry
-  # ----------------------------------------------------------
-  
-  save_sf_parquet <- function(x, filename) {
-    
-    x_parquet <- x %>%
-      dplyr::mutate(
-        geometry_wkt = sf::st_as_text(sf::st_geometry(.))
-      ) %>%
-      sf::st_drop_geometry()
-    
-    arrow::write_parquet(
-      x_parquet,
-      file.path(out_dir, filename)
-    )
-  }
-  
-  
-  # ----------------------------------------------------------
-  # 5. Save spatial vector outputs as parquet
-  # ----------------------------------------------------------
-  
-  save_sf_parquet(
-    results$model_sf,
-    paste0(prefix, "_model_sf.parquet")
-  )
-  
-  save_sf_parquet(
-    results$pred_grid_env,
-    paste0(prefix, "_pred_grid_env.parquet")
-  )
-  
-  save_sf_parquet(
-    results$harvest_regions,
-    paste0(prefix, "_harvest_regions.parquet")
-  )
-  
-  
-  # ----------------------------------------------------------
-  # 6. Save raster prediction as xyz parquet and GeoTIFF
-  # ----------------------------------------------------------
-  
-  pred_raster_df <- terra::as.data.frame(
-    results$pred_raster,
-    xy = TRUE,
-    na.rm = FALSE
-  )
-  
-  arrow::write_parquet(
-    pred_raster_df,
-    file.path(out_dir, paste0(prefix, "_pred_raster_xyz.parquet"))
-  )
-  
-  terra::writeRaster(
-    results$pred_raster,
-    file.path(out_dir, paste0(prefix, "_pred_raster.tif")),
-    overwrite = TRUE
-  )
-  
-  
-  # ----------------------------------------------------------
-  # 7. Save prediction plot as PDF and PNG
-  # ----------------------------------------------------------
-  
-  ggplot2::ggsave(
-    filename = file.path(out_dir, paste0(prefix, "_prediction_plot.pdf")),
-    plot = results$plot,
-    width = 8,
-    height = 6
-  )
-  
-  ggplot2::ggsave(
-    filename = file.path(out_dir, paste0(prefix, "_prediction_plot.png")),
-    plot = results$plot,
-    width = 8,
-    height = 6,
-    dpi = 300
-  )
-  
-  # ----------------------------------------------------------
-  # 7. Save harvest conditional prediction plot as PDF and PNG
-  # ----------------------------------------------------------
-  if(!is.null(results$harvest_conditional_plot)){
-    ggplot2::ggsave(
-      filename = file.path(out_dir, paste0(prefix, "_harvest_conditional_plot.pdf")),
-      plot = results$harvest_conditional_plot,
-      width = 8,
-      height = 6
-    )
-    
-    ggplot2::ggsave(
-      filename = file.path(out_dir, paste0(prefix, "_harvest_conditional_plot.png")),
-      plot = results$harvest_conditional_plot,
-      width = 8,
-      height = 6,
-      dpi = 300
-    )
-  } 
-  
-  # ----------------------------------------------------------
-  # 8. Return saved file paths
-  # ----------------------------------------------------------
-  
-  saved_files <- list.files(
-    out_dir,
-    pattern = prefix,
-    full.names = TRUE
-  )
-  
-  return(saved_files)
 }
