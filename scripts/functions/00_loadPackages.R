@@ -32,17 +32,19 @@ necessaryPackages <- c("sf",
                        "mda",
                        "earth",
                        "smoothr",
-                       "gam"
+                       "gam",
+                      "spThin",
+                      "dbscan"
 )
 uninstalledPackages <- necessaryPackages[!(necessaryPackages %in% row.names(installedPackages))]
 
 
 load_required_packages <- function(pkgs) {
-  
+
   missing_pkgs <- pkgs[
     !vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)
   ]
-  
+
   if (length(missing_pkgs) > 0) {
     stop(
       "Missing packages: ",
@@ -53,7 +55,7 @@ load_required_packages <- function(pkgs) {
       "))"
     )
   }
-  
+
   invisible(
     lapply(
       pkgs,
@@ -83,9 +85,9 @@ load_required_packages(necessaryPackages)
 # library(tidyr)
 # library(arrow)
 # library(smoothr)
-# 
+#
 # # for modelling
-# 
+#
 # library(gamm4)
 # library(mgcv)
 # library(pROC)

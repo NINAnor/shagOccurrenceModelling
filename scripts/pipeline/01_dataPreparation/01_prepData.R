@@ -1,265 +1,240 @@
 # ============================================================
-# Build used-available modelling dataset
+# Build used-available modelling dataset and environmental rasters
 # ============================================================
-# Spatial reference:
-# All spatial objects are assumed to be in WGS 84 / UTM zone 32N.
 #
-# Main outputs:
-#   dmodel123 = processed model data for 2023
-#   dmodel124 = processed model data for 2024
-#   dmodel    = combined 2023 + 2024 model dataset
+# Purpose:
+#  - Load spatial and tracking inputs (colony, kelp polygons, dive locations, harvest)
+#  - For each year, create used-available datasets via the pipeline helpers:
+#      process_dloctare(), generate_available_points(), add_harvest_overlap(), make_year_dmodel()
+#  - Combine years, finalise the modelling dataset
+#  - Build 10 m environmental rasters (bathymetry, substrate, kelp mask)
+#  - Save processed datasets and raster stacks to path_for_processed_data
+#
+# Assumptions:
+#  - The following helper functions are available in the environment:
+#      process_dloctare, generate_available_points, add_harvest_overlap,
+#      make_year_dmodel, finalise_dmodel, create_10m_raster
+#  - The .RData files referenced below (colony, tare, dloc23, dloc24, SK_35km_22_23, SK_35km_23_24)
+#    exist at the indicated relative paths and when loaded create objects with the names used here.
+#  - path_for_processed_data is defined and points to a writable directory.
+#  - Spatial CRS: project uses a projected CRS with meter units (e.g. UTM zone 32N).
 # ============================================================
 
+# ----------------------------
+# Required packages (simple checks)
+# ----------------------------
+required_pkgs <- c("sf", "terra", "dplyr", "arrow", "ggplot2")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs)) {
+  stop("Install required packages before running: ", paste(missing_pkgs, collapse = ", "))
+}
 
-# ------------------------------------------------------------
-# 1. Load spatial and tracking data
-# ------------------------------------------------------------
+# ----------------------------
+# 1) Load core spatial/tracking data
+#    (these files are expected to create objects with the names below)
+# ----------------------------
+message("Loading base data (expect pre-saved R objects).")
 
-# Colony location
-load("../colony")
-study_region <- sf::st_buffer(colony, dist = 33000)
+# Colony location (object: colony)
+load("../colony")         # defines 'colony' sf object
+study_region <- sf::st_buffer(colony, dist = 33000)  # 33 km study buffer
 
-# Kelp forest polygons
-load("../tare")
+# Kelp forest polygons (object: tare)
+load("../tare")           # defines 'tare' sf object
 
-# Dive locations from 2024
-# Object name after loading: dloc
-load("../dloc24")
+# Dive locations: 2023 and 2024
+load("../dloc23")         # defines 'dloc23' (2023 dives)
+load("../dloc24")         # defines 'dloc'  (2024 dives; named 'dloc' after loading)
 
-# Dive locations from 2023
-# Object name after loading: dloc23
-load("../dloc23")
+# Harvest information (two datasets covering different year windows)
+load("../SK_35_22_23")    # defines 'SK_35km_22_23'
+load("../SK_35_23_24")    # defines 'SK_35km_23_24'
 
-# Kelp harvest information for 2022/2023,
-# restricted to within 35 km of Sklinna
-load("../SK_35_22_23")
+# ----------------------------
+# Check that output path exists or will be created
+# ----------------------------
+if (!exists("path_for_processed_data")) stop("path_for_processed_data must be defined (output directory).")
+dir.create(path_for_processed_data, recursive = TRUE, showWarnings = FALSE)
 
-# Kelp harvest information for 2023/2024,
-# restricted to within 35 km of Sklinna
-load("../SK_35_23_24")
+# ----------------------------
+# Only re-run processing if final dmodel file does not already exist
+# ----------------------------
+dmodel_rdata_path <- file.path(path_for_processed_data, "dmodel.RData")
+if (!file.exists(dmodel_rdata_path)) {
 
+  message("Processing year-specific datasets (this may take some time).")
 
-if(!file.exists(file.path(path_for_processed_data, "dmodel.RData"))){
-# ------------------------------------------------------------
-# 2. Process 2023 dive locations
-# ------------------------------------------------------------
+  # ------------------------------------------------------------
+  # 2) Process 2023 dive locations: clip to kelp, generate available points, add harvest covariates
+  # ------------------------------------------------------------
+  result23 <- make_year_dmodel(
+    dloc_year   = dloc23,
+    tare        = tare,
+    colony      = colony,
+    harvest     = SK_35km_22_23,
+    year        = "2023",
+    n_per_point = n_per_point,        # assumed defined earlier in pipeline
+    min_dist_m  = 1000,
+    ID_buffer_m = ID_buffer_m,        # assumed defined earlier
+    group_by_ID = TRUE,
+    harvest_buffer = harvest_buffer,  # assumed defined earlier
+    thin_dist_km = 0.05,
+    min_frac_in_bg = 0.25
+  )
+  dmodel123 <- result23$dmodel
 
-result23 <- make_year_dmodel(
-  dloc_year   = dloc23,
-  tare        = tare,
-  colony      = colony,
-  harvest     = SK_35km_22_23,
-  year        = "2023",
-  n_per_point = n_per_point,
-  min_dist_m  = 1000,
-  ID_buffer_m = ID_buffer_m, 
-  group_by_ID = TRUE
-)
+  # ------------------------------------------------------------
+  # 3) Process 2024 dive locations
+  # ------------------------------------------------------------
+  result24 <- make_year_dmodel(
+    dloc_year   = dloc,
+    tare        = tare,
+    colony      = colony,
+    harvest     = SK_35km_23_24,
+    year        = "2024",
+    n_per_point = n_per_point,
+    min_dist_m  = 1000,
+    ID_buffer_m = ID_buffer_m,
+    group_by_ID = TRUE,
+    harvest_buffer = harvest_buffer,
+    thin_dist_km = 0.05,
+    min_frac_in_bg = 0.25
+  )
+  dmodel124 <- result24$dmodel
 
-# Extract the processed 2023 model dataset
-dmodel123 <- result23$dmodel
+  # ------------------------------------------------------------
+  # 4) Quick diagnostics (plots returned by helper functions)
+  #    Users can display or save these as needed.
+  # ------------------------------------------------------------
+  tryCatch({
+    print(result23$dloctare$plot)                # dive locations clipped to kelp (2023)
+    print(result23$avail_results$plot)           # used vs available (2023)
+    print(result24$dloctare$plot)                # (2024)
+    print(result24$avail_results$plot)           # (2024)
+  }, error = function(e) {
+    message("One or more diagnostic plots failed to render: ", conditionMessage(e))
+  })
 
+  # ------------------------------------------------------------
+  # 5) Combine years and finalise modelling dataframe
+  # ------------------------------------------------------------
+  dmodel <- finalise_dmodel(
+    dmodel23     = dmodel123,
+    dmodel24     = dmodel124,
+    datetime_col = "UTC_datetime"
+  )
 
-# ------------------------------------------------------------
-# 3. Process 2024 dive locations
-# ------------------------------------------------------------
+  # Save final combined dataset for later runs
+  save(dmodel, file = dmodel_rdata_path)
+  message("Saved combined dmodel to: ", dmodel_rdata_path)
 
-result24 <- make_year_dmodel(
-  dloc_year   = dloc,
-  tare        = tare,
-  colony      = colony,
-  harvest     = SK_35km_23_24,
-  year        = "2024",
-  n_per_point = n_per_point,
-  min_dist_m  = 1000,
-  ID_buffer_m = ID_buffer_m, 
-  group_by_ID = TRUE
-)
-
-# Extract the processed 2024 model dataset
-dmodel124 <- result24$dmodel
-
-
-# ------------------------------------------------------------
-# 4. Diagnostic plots
-# ------------------------------------------------------------
-
-# 2023: dive locations clipped to kelp habitat
-result23$dloctare$plot
-
-# 2023: observed and available points
-result23$avail_results$plot
-
-# 2024: dive locations clipped to kelp habitat
-result24$dloctare$plot
-
-# 2024: observed and available points
-result24$avail_results$plot
-
-
-# ------------------------------------------------------------
-# 5. Combine 2023 and 2024 datasets
-# ------------------------------------------------------------
-
-dmodel <- finalise_dmodel(
-  dmodel23     = dmodel123,
-  dmodel24     = dmodel124,
-  datetime_col = "UTC_datetime"
-)
-
-save(
-  dmodel,
-  file = file.path(path_for_processed_data, "dmodel.RData")
-)
 } else {
-  load(file.path(path_for_processed_data, "dmodel.RData"))
-}
-# ------------------------------------------------------------
-# 6. Inspect final dataset
-# ------------------------------------------------------------
-
-if(checks){
-summary(dmodel)
-str(dmodel)
-
-table(dmodel$Year, dmodel$random)
-table(dmodel$Year, dmodel$harvested50m)
-table(dmodel$Year, dmodel$harvested50m, dmodel$random)
+  message("Found existing dmodel file: loading ", dmodel_rdata_path)
+  load(dmodel_rdata_path)  # loads 'dmodel'
 }
 
-# ------------------------------------------------------------
-# Load GEBCO bathymetry
-# ------------------------------------------------------------
-if(!file.exists(file.path(path_for_processed_data, "env_stack_10m.parquet"))){
-gebco <- terra::rast(
-  "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/gebco_2019_n85.0_s50.0_w0.0_e40.0.nc"
-)
+# ----------------------------
+# Optional checks if 'checks' flag enabled earlier in script
+# ----------------------------
+if (exists("checks") && isTRUE(checks)) {
+  message("Summary of final dmodel:")
+  print(summary(dmodel))
+  print(str(dmodel))
+  print(table(dmodel$Year, dmodel$random))
+  print(table(dmodel$Year, dmodel$harvested50m))
+  print(table(dmodel$Year, dmodel$harvested50m, dmodel$random))
+}
 
-gebco_10m <- create_10m_raster(
-  input_data = gebco,
-  study_region = study_region,
-  resolution = 10,
-  raster_name = "bathymetry"
-)
+# ============================================================
+# Environmental layers: create 10 m rasters and combine into env_stack_10m
+# Save to parquet for faster reload
+# ============================================================
 
-plot(gebco_10m)
+env_parquet_path <- file.path(path_for_processed_data, "env_stack_10m.parquet")
 
-# ------------------------------------------------------------
-# Load hard-substrate shapefile
-# ------------------------------------------------------------
-hard_substr <- sf::st_read(
-  "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Rock_hard_substr.shp"
-)
+if (!file.exists(env_parquet_path)) {
 
-hard_substr_10m <- create_10m_raster(
-  input_data = hard_substr,
-  study_region = study_region,
-  resolution = 10,
-  field = 1,
-  background = 0,
-  raster_name = "hard_substrate"
-)
+  message("Creating 10 m environmental rasters (bathymetry, substrates, tareskog).")
 
-plot(hard_substr_10m)
+  # 1) Load GEBCO bathymetry NetCDF and rasterise/reproject to 10 m template
+  gebco_nc <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/gebco_2019_n85.0_s50.0_w0.0_e40.0.nc"
+  if (!file.exists(gebco_nc)) stop("GEBCO NetCDF not found at: ", gebco_nc)
 
-# ------------------------------------------------------------
-# Load substrate_sediment shapefile
-# ------------------------------------------------------------
-sediment_substr <- sf::st_read(
-  "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Sediment.shp"
-)
+  gebco <- terra::rast(gebco_nc)
 
-sediment_substr_10m <- create_10m_raster(
-  input_data = sediment_substr,
-  study_region = study_region,
-  resolution = 10,
-  field = 1,
-  background = 0,
-  raster_name = "sediment_substrate"
-)
+  gebco_10m <- create_10m_raster(
+    input_data = gebco,
+    study_region = study_region,
+    resolution = 10,
+    raster_name = "bathymetry"
+  ) |> terra::scale()
+  # plot(gebco_10m)  # optional visual check
 
-plot(sediment_substr_10m)
-# ------------------------------------------------------------
-# Load kelp forest shapefile
-# ------------------------------------------------------------
+  # 2) Hard-substrate shapefile -> binary raster
+  hard_substr_shp <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Rock_hard_substr.shp"
+  hard_substr <- sf::st_read(hard_substr_shp, quiet = TRUE)
 
-tareskog <- sf::st_read(
-  "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Tareskog_merge.shp"
-)
+  hard_substr_10m <- create_10m_raster(
+    input_data = hard_substr,
+    study_region = study_region,
+    resolution = 10,
+    field = 1,
+    background = 0,
+    raster_name = "hard_substrate"
+  )
 
-tareskog_10m <- create_10m_raster(
-  input_data = tareskog,
-  study_region = study_region,
-  resolution = 10,
-  field = 1,
-  background = 0,
-  raster_name = "tareskog"
-)
+  # 3) Sediment substrate shapefile -> binary raster
+  sediment_shp <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Sediment.shp"
+  sediment_substr <- sf::st_read(sediment_shp, quiet = TRUE)
 
-plot(tareskog_10m)
+  sediment_substr_10m <- create_10m_raster(
+    input_data = sediment_substr,
+    study_region = study_region,
+    resolution = 10,
+    field = 1,
+    background = 0,
+    raster_name = "sediment_substrate"
+  )
 
+  # 4) Kelp forest mask shapefile -> binary raster (tareskog)
+  tareskog_shp <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Tareskog_merge.shp"
+  tareskog <- sf::st_read(tareskog_shp, quiet = TRUE)
 
-# ------------------------------------------------------------
-# Combine the three 10 m rasters into one raster stack
-# ------------------------------------------------------------
+  tareskog_10m <- create_10m_raster(
+    input_data = tareskog,
+    study_region = study_region,
+    resolution = 10,
+    field = 1,
+    background = 0,
+    raster_name = "tareskog"
+  )
 
-env_stack_10m <- c(
-  gebco_10m,
-  hard_substr_10m,
-  sediment_substr_10m,
-  tareskog_10m
-)
+  # 5) Stack layers and name consistently
+  env_stack_10m <- c(gebco_10m, hard_substr_10m, sediment_substr_10m, tareskog_10m)
+  names(env_stack_10m) <- c("bathymetry", "hard_substrate", "sediment_substrate", "tareskog")
 
-names(env_stack_10m) <- c(
-  "bathymetry",
-  "hard_substrate",
-  "sediment_substrate",
-  "tareskog"
-)
+  message("Environmental stack built: ", paste(names(env_stack_10m), collapse = ", "))
 
-# Check
-env_stack_10m
-plot(env_stack_10m)
+  # Optional quick plots for sanity
+  # plot(env_stack_10m)
 
+  # 6) Convert raster stack to dataframe (xyz) and save as parquet for quick re-load
+  env_stack_df <- terra::as.data.frame(env_stack_10m, xy = TRUE, na.rm = FALSE)
+  arrow::write_parquet(env_stack_df, env_parquet_path)
+  message("Saved env_stack_10m parquet to: ", env_parquet_path)
 
-# ------------------------------------------------------------
-# Convert raster stack to dataframe
-# ------------------------------------------------------------
-
-env_stack_df <- terra::as.data.frame(
-  env_stack_10m,
-  xy = TRUE,
-  na.rm = FALSE
-)
-
-
-# ------------------------------------------------------------
-# Save as parquet file
-# ------------------------------------------------------------
-
-arrow::write_parquet(
-  env_stack_df,
-  file.path(path_for_processed_data, "env_stack_10m.parquet")
-)
 } else {
-  env_stack_df <- arrow::read_parquet(
-    file.path(path_for_processed_data, "env_stack_10m.parquet")
-  )
-  
-  env_stack_10m <- terra::rast(
-    env_stack_df,
-    type = "xyz",
-    crs = sf::st_crs(study_region)$wkt
-  )
-  
-  names(env_stack_10m) <- c(
-    "bathymetry",
-    "hard_substrate",
-    "sediment_substrate",
-    "tareskog"
-  )
-  
-  #plot(env_stack_10m)
+  message("Loading existing env_stack_10m parquet: ", env_parquet_path)
+  env_stack_df <- arrow::read_parquet(env_parquet_path)
+
+  env_stack_10m <- terra::rast(env_stack_df, type = "xyz", crs = sf::st_crs(study_region)$wkt)
+  names(env_stack_10m) <- c("bathymetry", "hard_substrate", "sediment_substrate", "tareskog")
+
+  # Optional: plot(env_stack_10m)
 }
 
-
+# ============================================================
+# End of data preparation
+# Outputs available in current environment:
+#   dmodel, env_stack_10m, env_stack_df
+# ============================================================
