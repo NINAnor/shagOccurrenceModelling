@@ -50,18 +50,22 @@ create_harvest_dist_rasters <- function(harvest,
 
   # Create unioned buffers around harvest polygons for 50m and 200m
   # Use st_union to collapse to single geometry per buffer to speed rasterize
+  #harvest0 <- harvest |> sf::st_union() |> sf::st_make_valid()
   harvest50  <- harvest |> sf::st_buffer(dist = 50)  |> sf::st_union() |> sf::st_make_valid()
   harvest200 <- harvest |> sf::st_buffer(dist = 200) |> sf::st_union() |> sf::st_make_valid()
 
   # Convert to terra vect for raster operations
+  #harvest0_vect  <- terra::vect(harvest0)
   harvest50_vect  <- terra::vect(harvest50)
   harvest200_vect <- terra::vect(harvest200)
 
   # Rasterize buffers: 1 inside buffer, 0 outside. Use touches = TRUE to be conservative.
+ # r_h0 <- terra::rasterize(harvest0_vect, template, field = 1, background = 0, touches = TRUE)
   r_h50 <- terra::rasterize(harvest50_vect, template, field = 1, background = 0, touches = TRUE)
   r_h200 <- terra::rasterize(harvest200_vect, template, field = 1, background = 0, touches = TRUE)
   names(r_h50)  <- "harvested50m"
   names(r_h200) <- "harvested200m"
+  #names(r_h0)  <- "harvested0m"
 
   # Distance to colony (meters): compute on template, mask to study region, scale
   colony_vect <- terra::vect(colony)
@@ -96,83 +100,155 @@ create_harvest_dist_rasters <- function(harvest,
   )
 }
 
-#' Save raster results to disk (parquet + RData metadata)
+#' Save raster results to disk (parquet OR GeoTIFF + RData metadata)
 #'
-#' Saves the raster stack as a parquet table (x,y,layer-values) and stores
-#' non-raster metadata as an RData file. This keeps raster storage portable
-#' (but may be large).
+#' Save either a parquet table (x,y,band-values) or a compressed GeoTIFF of the
+#' raster stack, and save non-raster metadata as an RData file. The RData file
+#' includes a copy of the original list minus the large raster elements and
+#' also stores the original layer names so loads reconstruct correctly.
 #'
 #' @param raster_results list returned by create_harvest_dist_rasters()
 #' @param year character or numeric year label used in file names
 #' @param path_for_processed_data directory to write files (created if missing)
+#' @param importFile character: either "parquet" or "tif" (default "parquet")
+#' @param tif_options list with arguments passed to terra::writeRaster when writing TIF:
+#'                    e.g. list(datatype = "FLT4S",
+#'                                  gdal = c("COMPRESS=LZW","TILED=YES","BIGTIFF=YES"))
 #' @export
 save_raster_results <- function(raster_results,
                                 year,
-                                path_for_processed_data) {
-  if (!requireNamespace("arrow", quietly = TRUE)) stop("Install package 'arrow' to write parquet files.")
+                                path_for_processed_data,
+                                importFile = c("parquet", "raster"),
+                                tif_options = list(datatype = "FLT4S",
+                                                   gdal = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"))) {
+  importFile <- match.arg(importFile)
+
   if (!requireNamespace("terra", quietly = TRUE)) stop("Install package 'terra'.")
+  if (importFile == "parquet" && !requireNamespace("arrow", quietly = TRUE)) {
+    stop("Install package 'arrow' to write parquet files.")
+  }
 
   dir.create(path_for_processed_data, recursive = TRUE, showWarnings = FALSE)
 
-  parquet_file <- file.path(path_for_processed_data, paste0("raster_stack_", year, ".parquet"))
-  rdata_file <- file.path(path_for_processed_data, paste0("raster_results_", year, "_metadata.RData"))
+  # filenames
+  base_name <- paste0("raster_stack_", year)
+  parquet_file <- file.path(path_for_processed_data, paste0(base_name, ".parquet"))
+  tif_file     <- file.path(path_for_processed_data, paste0(base_name, ".tif"))
+  rdata_file   <- file.path(path_for_processed_data, paste0("raster_results_", year, "_metadata.RData"))
 
-  # Convert raster stack to data.frame (xyz)
-  raster_df <- terra::as.data.frame(raster_results$raster_stack, xy = TRUE, na.rm = FALSE)
-
-  # Write parquet
-  arrow::write_parquet(raster_df, parquet_file)
-
-  # Save metadata (non-raster components) as an RData file
+  # Store metadata: copy, but record layer names first
   raster_metadata <- raster_results
-  # remove large raster objects before saving metadata
+  raster_metadata$layer_names <- names(raster_results$raster_stack)
+
+  # Remove heavy raster objects from metadata copy before saving
   raster_metadata$harvested50m <- NULL
   raster_metadata$harvested200m <- NULL
   raster_metadata$DistNest <- NULL
+  raster_metadata$DistHarvest <- NULL
   raster_metadata$raster_stack <- NULL
 
-  save(raster_metadata, file = rdata_file)
+  if (importFile == "parquet") {
+    # Convert raster stack to data.frame (xyz)
+    message("Converting raster stack to dataframe (may be large) ...")
+    raster_df <- terra::as.data.frame(raster_results$raster_stack, xy = TRUE, na.rm = FALSE)
+
+    # Write parquet
+    message("Writing parquet to: ", parquet_file)
+    arrow::write_parquet(raster_df, parquet_file)
+
+    # Save metadata
+    message("Saving metadata to: ", rdata_file)
+    save(raster_metadata, file = rdata_file)
+
+    invisible(list(parquet = parquet_file, metadata = rdata_file))
+  } else {
+    # importFile == "tif": write GeoTIFF directly to the target path (no temp file)
+    message("Writing GeoTIFF directly to: ", tif_file)
+
+    # call writeRaster with user-provided tif_options (safe defaults exist)
+    write_args <- c(list(x = raster_results$raster_stack,
+                         filename = tif_file, overwrite = TRUE),
+                    tif_options)
+    do.call(terra::writeRaster, write_args)
+
+    # Save metadata (record path to tif in metadata)
+    raster_metadata$raster_file <- tif_file
+    message("Saved GeoTIFF to: ", tif_file)
+    message("Saving metadata to: ", rdata_file)
+    save(raster_metadata, file = rdata_file)
+
+    invisible(list(tif = tif_file, metadata = rdata_file))
+  }
 }
+
 
 #' Load raster results previously saved with save_raster_results()
 #'
-#' Reconstructs terra SpatRaster layers from the parquet table and attaches
-#' metadata loaded from the RData file. The function requires a reference CRS
-#' object (e.g. an sf geometry) to set the raster CRS on read.
+#' Reconstructs terra SpatRaster layers from a parquet table or a GeoTIFF and
+#' reattaches metadata loaded from the RData file. If parquet is used, a reference
+#' CRS (e.g. an sf object) is required; GeoTIFF stores CRS internally.
 #'
 #' @param year label used when saving
 #' @param path_for_processed_data directory where files were written
-#' @param crs_reference an sf object (or anything acceptable to sf::st_crs)
-#'                      used to set the CRS of the reconstructed raster stack
+#' @param crs_reference an sf object (or anything acceptable to sf::st_crs);
+#'                      required only when importFile == "parquet"
+#' @param importFile character: either "parquet" or "tif" (default "parquet")
 #' @return list matching the structure returned by create_harvest_dist_rasters()
 #' @export
 load_raster_results <- function(year,
                                 path_for_processed_data,
-                                crs_reference) {
-  if (!requireNamespace("arrow", quietly = TRUE)) stop("Install package 'arrow' to read parquet files.")
+                                crs_reference = NULL,
+                                importFile = c("parquet", "raster")) {
+  importFile <- match.arg(importFile)
+
   if (!requireNamespace("terra", quietly = TRUE)) stop("Install package 'terra'.")
+  if (importFile == "parquet" && !requireNamespace("arrow", quietly = TRUE)) {
+    stop("Install package 'arrow' to read parquet files.")
+  }
 
-  parquet_file <- file.path(path_for_processed_data, paste0("raster_stack_", year, ".parquet"))
-  rdata_file <- file.path(path_for_processed_data, paste0("raster_results_", year, "_metadata.RData"))
+  base_name <- paste0("raster_stack_", year)
+  parquet_file <- file.path(path_for_processed_data, paste0(base_name, ".parquet"))
+  tif_file     <- file.path(path_for_processed_data, paste0(base_name, ".tif"))
+  rdata_file   <- file.path(path_for_processed_data, paste0("raster_results_", year, "_metadata.RData"))
 
-  if (!file.exists(parquet_file)) stop("Parquet file not found: ", parquet_file)
   if (!file.exists(rdata_file)) stop("RData metadata file not found: ", rdata_file)
 
-  raster_df <- arrow::read_parquet(parquet_file)
-
-  # Recreate a SpatRaster from an xyz table. Ensure CRS is set from crs_reference.
-  crs_wkt <- sf::st_crs(crs_reference)$wkt
-  raster_stack <- terra::rast(raster_df, type = "xyz", crs = crs_wkt)
-
-  # Ensure layer names match the original contract
-  names(raster_stack) <- c("harvested50m", "harvested200m", "DistNest", "DistHarvest")
-
-  # Load metadata and reattach raster layers
   load(rdata_file) # loads raster_metadata
+
+  if (importFile == "parquet") {
+    if (is.null(crs_reference)) stop("crs_reference is required when loading from parquet.")
+    if (!file.exists(parquet_file)) stop("Parquet file not found: ", parquet_file)
+
+    message("Reading parquet: ", parquet_file)
+    raster_df <- arrow::read_parquet(parquet_file)
+
+    crs_wkt <- sf::st_crs(crs_reference)$wkt
+    message("Reconstructing SpatRaster from xyz table (setting CRS from crs_reference).")
+    raster_stack <- terra::rast(raster_df, type = "xyz", crs = crs_wkt)
+
+  } else {
+    # importFile == "tif"
+    if (!file.exists(tif_file)) stop("TIF file not found: ", tif_file)
+    message("Reading GeoTIFF: ", tif_file)
+    raster_stack <- terra::rast(tif_file)
+  }
+
+  # restore layer names if available in metadata; otherwise keep what's in raster_stack
+  if (!is.null(raster_metadata$layer_names)) {
+    names(raster_stack) <- raster_metadata$layer_names
+  }
+
+  # Reattach raster layers into the metadata structure (if the list expects specific elements)
   raster_results <- raster_metadata
-  raster_results$harvested50m <- raster_stack[["harvested50m"]]
-  raster_results$harvested200m <- raster_stack[["harvested200m"]]
-  raster_results$DistNest <- raster_stack[["DistNest"]]
+  ln <- names(raster_stack)
+
+  # Attach common expected layers if they exist in raster_stack
+  if ("harvested50m" %in% ln) raster_results$harvested50m <- raster_stack[["harvested50m"]]
+  if ("harvested200m" %in% ln) raster_results$harvested200m <- raster_stack[["harvested200m"]]
+  if ("DistNest" %in% ln) raster_results$DistNest <- raster_stack[["DistNest"]]
+  if ("DistHarvest" %in% ln) raster_results$DistHarvest <- raster_stack[["DistHarvest"]]
+
+  # Always include the full stack
   raster_results$raster_stack <- raster_stack
 
   raster_results

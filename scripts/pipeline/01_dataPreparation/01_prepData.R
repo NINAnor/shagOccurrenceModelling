@@ -76,10 +76,13 @@ if (!file.exists(dmodel_rdata_path)) {
     n_per_point = n_per_point,        # assumed defined earlier in pipeline
     min_dist_m  = 1000,
     ID_buffer_m = ID_buffer_m,        # assumed defined earlier
-    group_by_ID = TRUE,
+    group_by_ID = group_by_ID,
     harvest_buffer = harvest_buffer,  # assumed defined earlier
-    thin_dist_km = 0.05,
-    min_frac_in_bg = 0.25
+    thin_dist_km = thin_dist_km,
+    min_frac_in_bg = min_frac_in_bg,
+    thin_occ = thin_occ,
+    harvest_stratify = harvest_stratify,
+    weight_background_by_area = weight_background_by_area
   )
   dmodel123 <- result23$dmodel
 
@@ -94,11 +97,14 @@ if (!file.exists(dmodel_rdata_path)) {
     year        = "2024",
     n_per_point = n_per_point,
     min_dist_m  = 1000,
-    ID_buffer_m = ID_buffer_m,
-    group_by_ID = TRUE,
-    harvest_buffer = harvest_buffer,
-    thin_dist_km = 0.05,
-    min_frac_in_bg = 0.25
+    ID_buffer_m = ID_buffer_m,        # assumed defined earlier
+    group_by_ID = group_by_ID,
+    harvest_buffer = harvest_buffer,  # assumed defined earlier
+    thin_dist_km = thin_dist_km,
+    min_frac_in_bg = min_frac_in_bg,
+    thin_occ = thin_occ,
+    harvest_stratify = harvest_stratify,
+    weight_background_by_area = weight_background_by_area
   )
   dmodel124 <- result24$dmodel
 
@@ -149,10 +155,15 @@ if (exists("checks") && isTRUE(checks)) {
 # Environmental layers: create 10 m rasters and combine into env_stack_10m
 # Save to parquet for faster reload
 # ============================================================
-
+if(importFile == "parquet"){
 env_parquet_path <- file.path(path_for_processed_data, "env_stack_10m.parquet")
+} else if(importFile == "raster"){
+  env_parquet_path <- file.path(path_for_processed_data, "env_stack_10m.tif")
+}
 
 if (!file.exists(env_parquet_path)) {
+
+  study_region <- sf::st_buffer(colony, dist = 33000 + 10000)  # 33 km study buffer
 
   message("Creating 10 m environmental rasters (bathymetry, substrates, tareskog).")
 
@@ -215,6 +226,13 @@ if (!file.exists(env_parquet_path)) {
 
   message("Environmental stack built: ", paste(names(env_stack_10m), collapse = ", "))
 
+  terra::writeRaster(
+    x = env_stack_10m,
+    filename = env_parquet_path,
+    overwrite = TRUE,
+    datatype = "FLT4S",
+    gdal = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES")
+  )
   # Optional quick plots for sanity
   # plot(env_stack_10m)
 
@@ -224,12 +242,17 @@ if (!file.exists(env_parquet_path)) {
   message("Saved env_stack_10m parquet to: ", env_parquet_path)
 
 } else {
+  if(get_env_covs && importFile == "parquet"){
   message("Loading existing env_stack_10m parquet: ", env_parquet_path)
   env_stack_df <- arrow::read_parquet(env_parquet_path)
 
   env_stack_10m <- terra::rast(env_stack_df, type = "xyz", crs = sf::st_crs(study_region)$wkt)
   names(env_stack_10m) <- c("bathymetry", "hard_substrate", "sediment_substrate", "tareskog")
+  }
 
+  if(get_env_covs && importFile == "raster"){
+    env_stack_10m <- terra::rast(env_parquet_path, crs = sf::st_crs(study_region)$wkt)
+  }
   # Optional: plot(env_stack_10m)
 }
 
