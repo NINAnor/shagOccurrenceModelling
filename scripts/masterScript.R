@@ -36,7 +36,12 @@ checks <- FALSE           # run extra exploratory checks if TRUE
 seed <- 1994              # model RNG seed for reproducibility
 
 # default parameter-row index (overridden by command-line argument on server)
-param_row <- 1
+
+# default only if not already defined
+if (!exists("param_row")) {
+  param_row <- 2
+}
+
 
 
 # ============================================================
@@ -50,6 +55,9 @@ if (file.exists(".Rprofile")) source(".Rprofile")
 if (!exists("run_env")) {
   run_env <- "personal"
   warning("run_env not found in .Rprofile/.Renviron: assuming 'personal'.")
+
+  readRenviron("C:/Users/kwaku.adjei/.Renviron")
+  source("C:/Users/kwaku.adjei/.Rprofile")
 }
 
 # On non-personal environments (e.g., a server), read command-line args
@@ -113,16 +121,44 @@ terra_wopt_mt <- function(comp = "LZW", threads = NULL) {
 # Adjust file paths according to your project layout.
 
 rerunDataFormat <- FALSE
-if (rerunDataFormat) unlink(file.path(data_dir, "dmodel.RData"))
+if (rerunDataFormat) unlink(file.path(path_for_processed_data, "dmodel.RData"))
 
 # Sampling and buffering parameters used by the preparation scripts:
-n_per_point <- 5        # number of random background points per used point
+n_per_point <- 2       # number of random background points per used point
 ID_buffer_m <- 10000    # individual ID buffer (meters)
 harvest_buffer <- 50    # harvest buffer (meters)
+thin_dist_km <- 1
+min_frac_in_bg <- 0.25
+thin_occ <- FALSE
+harvest_stratify <- FALSE
+weight_background_by_area <- FALSE
+group_by_ID <- TRUE
+modelCrs <- 32633
+importFile <- "raster" # options: raster or parquet
+get_env_covs <- FALSE
 
+pars <- expand.grid(
+  Year = c("2023", "2024"),
+  sex = c("Female", "Male"),
+  harvesttimeSK24 = c("afterJuneHarvest", "beforeJuneHarvest", "duringJuneHarvest"),
+  method = c("inla","gam"),
+  stringsAsFactors = FALSE
+)
+
+# Validate the requested parameter-row index
+if (param_row < 1 || param_row > nrow(pars)) {
+  stop("param_row is outside the parameter grid range.")
+}
+
+# Select the parameter combination to use in this run
+pars_to_use <- pars[param_row, , drop = FALSE]
+
+if(pars_to_use$method %in% "gam") get_env_covs <- TRUE
 # Source the pipeline preparation scripts (they must exist under scripts/pipeline/)
 source(file.path("scripts", "pipeline", "01_dataPreparation", "01_prepData.R"))
+if(get_env_covs){
 source(file.path("scripts", "pipeline", "01_dataPreparation", "02_prepPredictionRaster.R"))
+}
 source(file.path("scripts", "pipeline", "01_dataPreparation", "03_predictionCoords.R"))
 
 if (checks) {
@@ -138,11 +174,7 @@ if (checks) {
 # row from this grid based on `param_row`. Users can extend the grid with
 # more factors as required.
 
-pars <- expand.grid(
-  Year = levels(dmodel$Year),
-  method = c("gam"),
-  stringsAsFactors = FALSE
-)
+
 
 # Which harvest variables we will evaluate (fit_predict_habitat_model
 # will loop internally and return results per variable)
@@ -171,13 +203,7 @@ or_results <- dmodel %>%
   ) %>%
   sf::st_drop_geometry()
 
-# Validate the requested parameter-row index
-if (param_row < 1 || param_row > nrow(pars)) {
-  stop("param_row is outside the parameter grid range.")
-}
 
-# Select the parameter combination to use in this run
-pars_to_use <- pars[param_row, , drop = FALSE]
 
 # Convert to a list for passing into the model-fitting function
 pars_to_use_list <- list(
@@ -222,6 +248,12 @@ tryCatch({
   print(rt)
 
   # ----------------------------
+  # Save model outputs directory
+  # ----------------------------
+  output_dir <- file.path(result_dir, version_label, pars_to_use$method, pars_to_use$Year, pars_to_use$sex, pars_to_use$harvesttimeSK24)
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  # ----------------------------
   # Fit model and make predictions
   # ----------------------------
   # fit_predict_habitat_model should:
@@ -236,6 +268,7 @@ tryCatch({
   # Important arguments used here:
   #   response_col = "random"  -- the outcome column to use
   #   nBasis = 50              -- number of basis functions for GAM splines
+  if(pars_to_use$method %in% "gam"){
   set.seed(seed)
   model_results <- fit_predict_habitat_model(
     dmodel = dmodel,
@@ -250,22 +283,6 @@ tryCatch({
     nBasis = 50
   )
 
-  cat("\n==============================================\n")
-  cat("Model summary for year:", pars_to_use$Year, "\n")
-  cat("==============================================\n")
-  if (!is.null(model_results$method) && model_results$method == "gam") {
-    # Print summary for GAM fits (if applicable)
-    print(summary(model_results$model))
-  } else {
-    cat("Model method:", model_results$method, "\n")
-  }
-
-  # ----------------------------
-  # Save model outputs
-  # ----------------------------
-  output_dir <- file.path(result_dir, version_label, pars_to_use$method, pars_to_use$Year)
-  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-
   saved_files <- save_habitat_results_pro(
     results = model_results,
     out_dir = output_dir,
@@ -275,6 +292,49 @@ tryCatch({
 
   cat("\nSaved files:\n")
   print(saved_files)
+
+  } else if(pars_to_use$method %in% "inla"){
+
+    model_results <- run_shag_inla_model(
+      pars_to_use = pars_to_use,
+      dmodel = dmodel,
+      study_region = study_region,
+      path_for_processed_data = path_for_processed_data,
+      modelCrs = modelCrs,
+      thinning_distance = 1000
+    )
+
+    saved_files <- save_inla_results(
+      results = model_results,
+      out_dir = output_dir,
+      prefix = paste0(
+        pars_to_use$Year, "_",
+        pars_to_use$sex, "_",
+        pars_to_use$harvesttimeSK24
+      )
+    )
+
+    saved_files
+
+  }
+
+  cat("\n==============================================\n")
+  cat("Model summary for year:", pars_to_use$Year, "\n")
+  cat("==============================================\n")
+  if (!is.null(model_results$method) && model_results$method == "gam") {
+    # Print summary for GAM fits (if applicable)
+    print(summary(model_results$model))
+  } else {
+    cat("Model method:", model_results$method, "\n")
+
+    model_results$waic
+    summary(model_results$best_model)
+
+  }
+
+
+
+
 
   # Record completion time and minimal reproducibility info
   cat("\nFinished:", as.character(Sys.time()), "\n\n")

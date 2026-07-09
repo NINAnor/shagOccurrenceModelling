@@ -40,7 +40,11 @@ make_year_dmodel <- function(dloc_year,
                              harvest_buffer = 50,
                              thin_dist_km = 1,
                              min_frac_in_bg  = 0.5,
-                             group_by_ID = TRUE) {
+                             group_by_ID = TRUE,
+                             thin_occ = TRUE,
+                             harvest_stratify = TRUE,
+                             weight_background_by_area = TRUE
+                             ) {
 
   # -------------------------
   # Dependency checks
@@ -91,13 +95,13 @@ make_year_dmodel <- function(dloc_year,
     min_dist_m = min_dist_m,
     id_buffer_m = ID_buffer_m,
     group_by_id = isTRUE(group_by_ID),
-    thin_occ = TRUE,
+    thin_occ = thin_occ,
     thin_dist_km = thin_dist_km,
     harvest = harvest_year,
-    harvest_stratify = FALSE,
+    harvest_stratify = harvest_stratify,
     harvest_buffer_m = harvest_buffer,
     min_frac_in_bg = min_frac_in_bg,
-    weight_background_by_area = FALSE
+    weight_background_by_area = weight_background_by_area
   )
 
   combined_data <- avail_results$combined_data

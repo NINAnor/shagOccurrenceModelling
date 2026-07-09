@@ -35,9 +35,12 @@ missing_fns <- required_fns[!vapply(required_fns, exists, logical(1))]
 if (length(missing_fns) > 0) stop("Missing required helper functions: ", paste(missing_fns, collapse = ", "))
 
 # Helper to build/load for one year
-build_or_load_year <- function(year_label, harvest_obj) {
+build_or_load_year <- function(year_label, harvest_obj, importFile) {
+  if(importFile == "parquet"){
   parquet_path <- file.path(path_for_processed_data, paste0("raster_stack_", year_label, ".parquet"))
-
+  } else if(importFile == "raster"){
+    parquet_path <- file.path(path_for_processed_data, paste0("raster_stack_", year_label, ".tif"))
+}
   if (!file.exists(parquet_path)) {
     message("Raster parquet for ", year_label, " not found. Creating rasters...")
 
@@ -45,14 +48,16 @@ build_or_load_year <- function(year_label, harvest_obj) {
     rr <- create_harvest_dist_rasters(
       harvest = harvest_obj,
       colony = colony,
-      resolution = 10
+      resolution = 10,
+      buffer_m = 33000 + 10000
     )
 
     message("Saving raster results for ", year_label, " to ", path_for_processed_data)
     save_raster_results(
       raster_results = rr,
       year = as.character(year_label),
-      path_for_processed_data = path_for_processed_data
+      path_for_processed_data = path_for_processed_data,
+      importFile = importFile
     )
 
     # Return the created result
@@ -62,15 +67,16 @@ build_or_load_year <- function(year_label, harvest_obj) {
     rr <- load_raster_results(
       year = as.character(year_label),
       path_for_processed_data = path_for_processed_data,
-      crs_reference = colony
+      crs_reference = colony,
+      importFile = importFile
     )
     return(rr)
   }
 }
 
 # Build or load both years
-raster_results_23 <- build_or_load_year("2023", SK_35km_22_23)
-raster_results_24 <- build_or_load_year("2024", SK_35km_23_24)
+raster_results_23 <- build_or_load_year("2023", SK_35km_22_23, importFile)
+raster_results_24 <- build_or_load_year("2024", SK_35km_23_24, importFile)
 
 # Summary messages
 message("Raster results ready:")
