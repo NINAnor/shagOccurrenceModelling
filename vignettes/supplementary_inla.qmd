@@ -1,0 +1,557 @@
+---
+title: "Fitting the Shag Occurrence Model Using Log-Gaussian Cox Processes (LGCP) with INLA and inlabru"
+author: "Kwaku Peprah Adjei"
+date: "`r Sys.Date()`"
+bibliography: references.bib
+crossref:
+  fig-title: Figure
+  tbl-title: Table
+  eq-title: Equation
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+  docx:
+    toc: true
+    number-sections: true
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  echo: TRUE
+  warning: false
+  message: false
+link-citations: true
+---
+
+# Introduction
+
+Understanding how European shags use the marine environment requires accounting for both environmental heterogeneity and the strong spatial structure inherent in animal tracking data. Traditional habitat-selection approaches often model used and available locations using logistic regression or generalized additive models (GAMs). While useful, such models do not explicitly represent the underlying spatial point process that generates animal locations.
+
+To address this limitation, we model shag occurrences using a **Log-Gaussian Cox Process (LGCP)** fitted with **INLA** [@inla] and **inlabru** [@inlabru]. An LGCP treats observations as realizations of a spatial point process whose intensity varies continuously across space as a function of environmental covariates and latent spatial structure.
+
+The objective of the model is to estimate how occurrence intensity changes in relation to:
+
+- Distance to nest colonies (`DistNest`);
+- Distance to harvested kelp areas (`DistHarvest`);
+- Bathymetry (`bathymetry`);
+- Residual spatial processes not explained by measured covariates.
+
+This framework allows ecological drivers and unexplained spatial variability to be modelled simultaneously. 
+
+For further details of the LGCPs, we refer to @gomez2020bayesian, @zuur2017beginner and @blangiardo2015spatial.
+
+# Ecological rationale
+
+Shag observations are highly clustered in space because individuals repeatedly visit preferred foraging habitats and locations near breeding colonies.
+
+Consequently, observed locations typically exhibit:
+
+- strong environmental structure;
+- spatial autocorrelation;
+- unequal sampling intensity across the landscape.
+
+Ignoring these characteristics can lead to biased estimates of habitat selection.
+
+The LGCP framework naturally accommodates clustered point patterns by modelling the intensity of occurrence directly rather than modelling presences and pseudo-absences.
+
+# Point-process model formulation
+
+Let $s$ denote a location within the study region.
+
+The occurrence intensity at location $s$ is modelled as:
+
+$$
+\lambda(s)=\exp(\eta(s))
+$$
+
+where:
+
+- $\lambda(s)$ is the expected occurrence intensity;
+- $\eta(s)$ is the linear predictor.
+
+Higher values of $\lambda(s)$ indicate locations that are expected to be used more frequently.
+
+
+The linear predictor of the full spatial model is:
+
+$$
+\eta(s)
+=
+\beta_0
++
+\beta_1 DistNest(s)
++
+\beta_2 DistHarvest(s)
++
+\beta_3 Bathymetry(s)
++
+w(s)
+$$
+
+where:
+
+- $\beta_0$ is the intercept;
+- $\beta_1$ represents the effect of distance to nest colonies;
+- $\beta_2$ represents the effect of distance to harvested areas;
+- $\beta_3$ represents the effect of bathymetry;
+- $w(s)$ is a spatially structured Gaussian random field.
+
+Interpretation of coefficient signs is straightforward:
+
+- Negative `DistNest` coefficients indicate selection for areas closer to colonies.
+- Negative `DistHarvest` coefficients indicate selection for areas closer to harvested kelp regions.
+- Positive `DistHarvest` coefficients indicate avoidance of harvested regions.
+- Positive bathymetry coefficients indicate increased occurrence intensity with increasing bathymetry values.
+
+# Environmental covariates
+
+Three environmental predictors were included.
+
+## Distance to nest colonies
+
+```r
+DistNest
+```
+
+This raster represents the distance from each location to the nearest nesting colony.
+
+The ecological expectation is that occurrence intensity declines with increasing distance from colonies because commuting costs increase with travel distance.
+
+## Distance to harvested kelp areas
+
+```r
+DistHarvest
+```
+
+This raster measures the distance from each location to the nearest harvested kelp area.
+
+The sign and magnitude of this coefficient provide direct evidence regarding attraction toward or avoidance of harvested regions.
+
+## Bathymetry
+
+```r
+bathymetry
+```
+
+Bathymetry represents depth-related characteristics of the marine environment and is included to account for known relationships between shag foraging behaviour and seabed structure.
+
+## Covariate preprocessing
+
+All continuous covariates are standardised before model fitting:
+
+$$
+z_i = \frac{x_i-\mu}{\sigma}
+$$
+
+where:
+
+- $\mu$ is the mean;
+- $\sigma$ is the standard deviation.
+
+Standardisation provides several advantages:
+
+- comparable coefficient magnitudes;
+- improved numerical stability;
+- easier interpretation of effect sizes;
+- better prior specification.
+
+Following standardisation, a coefficient represents the effect of a one-standard-deviation change in a predictor.
+
+# Presence data
+
+Occurrence locations were obtained from the tracking dataset ([see details here]()) and filtered according to:
+
+- Year;
+- Sex;
+- Harvest period.
+
+For example:
+
+```r
+pres_sf <- dmodel |>
+  filter(
+    Year == "2024",
+    sex == "Female",
+    harvesttimeSK24 == "afterJuneHarvest",
+    random == 1
+  )
+```
+
+Only observed locations were retained for point-process modelling.
+
+## Duplicate removal
+
+Exact duplicate coordinates can occur due to repeated GPS fixes at identical locations.
+
+Duplicates were removed before model fitting:
+
+```r
+distinct(X, Y, .keep_all = TRUE)
+```
+
+This ensures that each coordinate contributes only once to the likelihood.
+
+## Spatial thinning
+
+### Motivation
+
+Animal tracking data often contain large numbers of observations separated by only a few metres.
+
+These observations are not independent and can dominate model estimation.
+
+Spatial thinning was therefore applied to reduce redundancy and improve inference.
+
+### Thinning procedure
+
+A minimum separation distance was imposed between retained observations.
+
+Several thinning distances were explored:
+
+| Distance | Retained observations |
+|-----------|-----------:|
+| None | 2140 |
+| 500 m | 162 |
+| 1000 m | 76 |
+| 5000 m | 14 |
+
+The 1000-m thinning distance was ultimately selected because it provided a balance between reducing spatial clustering and retaining sufficient sample size.
+
+Importantly, comparisons of environmental distributions before and after thinning demonstrated that thinning reduced spatial redundancy while preserving habitat composition.
+
+# Spatial mesh construction and Spatial random field
+
+## Spatial mesh construction 
+
+The SPDE approach approximates the continuous spatial field using a finite-element mesh.
+
+The mesh was constructed using observed locations and the study region boundary.
+
+```r
+mesh_builder <- create_fmesher_mesh_from_locations(
+  points_sf = pres_sf,
+  study_region_sf = study_region,
+  target_crs = modelCrs,
+  offset = c(2000, 10000),
+  max_edge = c(3000, 10000),
+  cutoff = 1000
+)
+```
+
+### Offset
+
+The mesh extends beyond the study area boundary using:
+
+```r
+offset = c(2000,10000)
+```
+
+to reduce edge effects during estimation.
+
+### Maximum edge length
+
+```r
+max_edge = c(3000,10000)
+```
+
+controls triangle size and therefore the spatial resolution of the latent field.
+
+### Cutoff
+
+```r
+cutoff = 1000
+```
+
+prevents excessive mesh density around clusters of observations.
+
+## Spatial random field
+
+A Matérn Gaussian random field was used to model residual spatial dependence.
+
+### SPDE specification
+
+```r
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2,
+  prior.range = c(3000, 0.5),
+  prior.sigma = c(0.5, 0.01)
+)
+```
+
+### Range prior
+
+The range parameter determines the spatial scale over which locations are correlated.
+
+The prior:
+
+```r
+prior.range = c(3000, 0.5)
+```
+
+implies
+
+$$
+P(range < 3000 \, m)=0.5
+$$
+
+providing moderate prior support for broad-scale spatial patterns.
+
+### Variance prior
+
+The standard deviation prior:
+
+```r
+prior.sigma = c(0.5,0.01)
+```
+
+implies
+
+$$
+P(\sigma > 0.5)=0.01
+$$
+
+which shrinks the spatial field toward zero in the absence of strong evidence for residual spatial structure.
+
+# Model Fitting
+
+## Candidate models
+
+Two competing models were fitted.
+
+### Spatial LGCP
+
+The spatial model included environmental covariates and the SPDE field:
+
+```r
+~
+Intercept(1) +
+DistNest(main = DistNest) +
+DistHarvest(main = DistHarvest) +
+bathymetry(main = bathymetry) +
+spatial(
+  geometry,
+  model = spde
+)
+```
+
+### Non-spatial LGCP
+
+A simpler model excluded the spatial field:
+
+```r
+~
+Intercept(1) +
+DistNest(main = DistNest) +
+DistHarvest(main = DistHarvest) +
+bathymetry(main = bathymetry)
+```
+
+Comparing these models allows evaluation of whether environmental covariates alone explain occurrence patterns or whether additional residual spatial structure remains.
+
+## Estimation
+
+Models were fitted using the Cox-process likelihood:
+
+```r
+family = "cp"
+```
+
+through the `bru()` interface.
+
+Environmental rasters were supplied directly through:
+
+```r
+data_extra = cov_env
+```
+
+rather than attaching raster values to the point data.
+
+This approach ensures that covariate values are extracted consistently at both observation locations and integration points.
+
+## Integration points
+
+Likelihood approximation in LGCP models requires numerical integration across the study region.
+
+Integration points were generated automatically from the mesh and study-area polygon:
+
+```r
+fm_int(mesh,
+       samplers = region_sf)
+```
+
+These points represent habitat availability and provide the quadrature scheme used to approximate the point-process likelihood.
+
+## Model comparison
+
+Models were compared using:
+
+### WAIC
+
+The Widely Applicable Information Criterion (WAIC) was used as the primary model-selection metric.
+
+Lower WAIC values indicate improved predictive performance.
+
+### DIC
+
+The Deviance Information Criterion (DIC) was also computed as a supplementary measure of model fit.
+
+### Marginal log-likelihood
+
+Marginal log-likelihood values were examined to evaluate relative model support.
+
+The preferred model was the one with the lowest WAIC while also producing ecologically interpretable parameter estimates.
+
+## Prediction
+
+Predictions were generated across a regular grid covering the study region.
+
+```r
+px <- fm_pixels(
+  mesh,
+  dim = c(500,500),
+  mask = region_sf
+)
+```
+
+Environmental covariate values were extracted for each prediction pixel.
+
+## Distance-to-harvest effect maps
+
+To isolate the effect of harvesting, predictions were produced using:
+
+```r
+pred_dh <- predict(
+  best_model,
+  pred_data,
+  ~ exp(
+      Intercept +
+      DistHarvest
+  )
+)
+```
+
+These maps represent the contribution of the harvest-distance covariate alone.
+
+They should therefore be interpreted as relative intensity surfaces describing how occurrence changes with distance from harvested areas while holding all other predictors constant.
+
+## Habitat suitability maps
+
+Full environmental predictions were generated as:
+
+```r
+pred_full <- predict(
+  best_model,
+  pred_data,
+  ~ exp(
+      Intercept +
+      DistNest +
+      DistHarvest +
+      bathymetry
+  )
+)
+```
+
+These maps represent predicted occurrence intensity arising from all environmental covariates combined.
+
+The spatial random field was deliberately excluded from these predictions to facilitate ecological interpretation of habitat relationships.
+
+## Interpretation of coefficients
+
+Because predictors are standardised, coefficients can be interpreted as effects associated with a one-standard-deviation change in a covariate.
+
+For example:
+
+If
+
+$$
+\beta=-1
+$$
+
+then
+
+$$
+exp(-1)=0.37
+$$
+
+meaning occurrence intensity is expected to decline by approximately 63% for a one-standard-deviation increase in the predictor.
+
+Similarly,
+
+$$
+\beta=1
+$$
+
+implies
+
+$$
+exp(1)=2.72
+$$
+
+meaning occurrence intensity is expected to increase approximately 2.7-fold.
+
+# Visualisation and sensitivity analyses
+
+## Visualisation
+
+Predictions were visualised using the colour-blind-safe **Cividis** palette.
+
+```r
+scale_colour_viridis_c(
+  option = "cividis"
+)
+```
+
+Maps contain three primary elements:
+
+| Layer | Representation |
+|---------|---------|
+| Predicted intensity | Cividis colour scale |
+| Shag locations | Orange points |
+| Harvest areas | Black outlines |
+
+This combination maximises interpretability while remaining accessible to readers with colour-vision deficiencies.
+
+
+## Sensitivity analyses
+
+Several sensitivity analyses were conducted to evaluate robustness.
+
+These included:
+
+- comparing thinned and unthinned datasets;
+- comparing multiple thinning distances;
+- evaluating non-spatial and spatial models;
+- varying SPDE prior assumptions;
+- examining environmental distributions at used and available locations.
+
+These analyses were used to assess the potential influence of spatial confounding and sampling redundancy on parameter estimates.
+
+# Reproducibility
+
+All model runs save:
+
+- fitted models;
+- prediction surfaces;
+- summary statistics;
+- WAIC and DIC values;
+- prediction plots;
+- session information.
+
+This ensures complete reproducibility of analyses and facilitates future model comparisons.
+
+# Summary
+
+The LGCP-INLA framework provides a flexible and statistically rigorous approach for modelling shag occurrence patterns.
+
+Key strengths of the approach include:
+
+- direct modelling of occurrence intensity;
+- explicit treatment of spatial autocorrelation;
+- incorporation of environmental covariates as continuous spatial fields;
+- efficient Bayesian inference through INLA;
+- straightforward generation of habitat suitability surfaces.
+
+The resulting models allow robust assessment of habitat associations while accounting for the spatial structure that characterises animal tracking data.
