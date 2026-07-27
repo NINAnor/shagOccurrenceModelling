@@ -1,3 +1,37 @@
+study_region_details <- function(study_region){
+  study_region <- sf::st_buffer(colony, dist = 33000 + 10000)  # 33 km study buffer
+  # Ensure study_region is a single (unioned) polygon and obtain CRS WKT
+  study_union <- sf::st_union(study_region)
+  study_crs_wkt <- sf::st_crs(study_region)$wkt
+  if (is.na(study_crs_wkt) || study_crs_wkt == "") stop("study_region must have a valid projected CRS (with meter units)")
+
+  # Convert study region to terra vect for raster operations
+
+  study_union_sf <- sf::st_sf(
+    geometry = study_union
+  )
+
+  study_vect <- terra::vect(study_union_sf)
+
+  #study_vect <- terra::vect(study_union)
+
+  # Create template raster aligned to study region extent and CRS
+  template <- terra::rast(
+    extent = terra::ext(study_vect),
+    resolution = 10,
+    crs = study_crs_wkt
+  )
+
+  ret <- list(study_region = study_region,
+              study_union = study_union,
+              study_vect = study_vect,
+              template = template)
+
+  return(ret)
+}
+
+
+
 #' Create a 10m (or user-specified resolution) raster layer from vector or raster input
 #'
 #' This helper loads, reprojects, crops/masks, and (if needed) rasterises input
@@ -25,7 +59,7 @@
 #'
 #' @export
 create_10m_raster <- function(input_data,
-                              study_region,
+                              study_region_list,
                               resolution = 10,
                               field = 1,
                               background = 0,
@@ -42,25 +76,35 @@ create_10m_raster <- function(input_data,
   # ------------------------
   # Validate inputs
   # ------------------------
-  if (!inherits(study_region, "sf")) stop("study_region must be an sf object")
+  if (!inherits(study_region_list, "list")) stop("study_region must be an sf object")
   if (!(inherits(input_data, "SpatRaster") || inherits(input_data, "sf"))) {
     stop("input_data must be either a terra SpatRaster or an sf object")
   }
 
-  # Ensure study_region is a single (unioned) polygon and obtain CRS WKT
-  study_union <- sf::st_union(study_region)
-  study_crs_wkt <- sf::st_crs(study_region)$wkt
-  if (is.na(study_crs_wkt) || study_crs_wkt == "") stop("study_region must have a valid projected CRS (with meter units)")
 
-  # Convert study region to terra vect for raster operations
-  study_vect <- terra::vect(study_union)
+
+  # Ensure study_region is a single (unioned) polygon and obtain CRS WKT
+  study_union <- sf::st_union(study_region_list$study_union)
+   study_crs_wkt <- sf::st_crs(study_region_list$study_region)$wkt
+  # if (is.na(study_crs_wkt) || study_crs_wkt == "") stop("study_region must have a valid projected CRS (with meter units)")
+  #
+  # # Convert study region to terra vect for raster operations
+  #
+  # study_union_sf <- sf::st_sf(
+  #   geometry = study_union
+  # )
+  #
+  # study_vect <- terra::vect(study_union_sf)
+
+  study_vect <- study_region_list$study_vect
 
   # Create template raster aligned to study region extent and CRS
-  template <- terra::rast(
-    extent = terra::ext(study_vect),
-    resolution = resolution,
-    crs = study_crs_wkt
-  )
+  template <- study_region_list$template
+  # template <- terra::rast(
+  #   extent = terra::ext(study_vect),
+  #   resolution = resolution,
+  #   crs = study_crs_wkt
+  # )
 
   # ------------------------
   # Case A: input is a SpatRaster
@@ -75,7 +119,7 @@ create_10m_raster <- function(input_data,
     )
 
     # Crop and mask to study extent
-    input_crop <- terra::crop(input_proj, study_vect)
+    input_crop <- terra::crop(input_proj,  study_vect)
     input_mask <- terra::mask(input_crop, study_vect)
 
     # Resample to the template resolution & alignment

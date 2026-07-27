@@ -47,8 +47,13 @@ create_fmesher_mesh_from_locations <- function(points_sf,
   if (nrow(pts_in) < 3)
     stop("Need at least 3 points inside the study region.")
 
+  region_simple <-
+    region_union |>
+    sf::st_simplify(dTolerance = 500)
+
+
   ## ---- Boundary ----
-  boundary <- fmesher::fm_as_segm(region_union)
+  boundary <- fmesher::fm_as_segm(region_simple)
 
   ## ---- Mesh ----
   mesh <- fmesher::fm_mesh_2d(
@@ -67,3 +72,47 @@ create_fmesher_mesh_from_locations <- function(points_sf,
     crs = crs_use
   )
 }
+
+# choose_pc_priors_binomial <- function(coords,
+#                                       range_fraction = 100, #0.2,
+#                                       p_range = 0.5,
+#                                       s0 = 1,
+#                                       p_sigma = 0.01) {
+#
+#   coords <- as.matrix(coords)
+#
+#   max_dist <- max(dist(coords))
+#   min_dist <- min(dist(coords))
+#
+#   r0 <- range_fraction * min_dist #range_fraction * max_dist
+#   if(r0 > 3000) r0 <- 3000
+#
+#   list(
+#     prior.range = c(r0, p_range),
+#     prior.sigma = c(s0, p_sigma),
+#     max.distance = max_dist,
+#     min_dist = min_dist
+#   )
+# }
+
+choose_pc_priors_binomial <- function(study_region,
+                                      range_fraction = 5,
+                                      p_range = 0.5,
+                                      s0 = 1,
+                                      p_sigma = 0.01) {
+
+  bb <- sf::st_bbox(study_region)
+
+  extent <- max(
+    bb["xmax"] - bb["xmin"],
+    bb["ymax"] - bb["ymin"]
+  )
+
+  r0 <- extent / range_fraction
+
+  list(
+    prior.range = c(r0, p_range),
+    prior.sigma = c(s0, p_sigma)
+  )
+}
+

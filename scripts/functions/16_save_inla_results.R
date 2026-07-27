@@ -76,6 +76,29 @@ save_inla_results <- function(results,
     )
   }
 
+  if (!is.null(results$fit_nospatialindividual)) {
+
+    txt_file <- file.path(
+      out_dir,
+      paste0(prefix, "_nospatialindividual_summary.txt")
+    )
+
+    capture.output(
+      summary(results$fit_nospatialindividual),
+      file = txt_file
+    )
+
+    saved <- c(saved, txt_file)
+
+    saveRDS(
+      results$fit_nospatialindividual,
+      file.path(
+        out_dir,
+        paste0(prefix, "_fit_nospatialindividual.rds")
+      )
+    )
+  }
+
   #--------------------------------------------------
   # Save WAIC table
   #--------------------------------------------------
