@@ -35,13 +35,7 @@ version_number <- 2      # increment for new published runs
 checks <- FALSE           # run extra exploratory checks if TRUE
 seed <- 1994              # model RNG seed for reproducibility
 
-# default parameter-row index (overridden by command-line argument on server)
 
-# default only if not already defined
-#if (!exists("param_row")) {
-#for(param_row in 1:12){
-  param_row <- 4
-#}
 
 
 
@@ -73,7 +67,7 @@ if (!run_env %in% "personal") {
 message("Working directory: ", ifelse(exists("project_dir"), project_dir, "project_dir not set"))
 message("Temporary directory: ", ifelse(exists("temp_dir"), temp_dir, "temp_dir not set"))
 message("Data directory: ", ifelse(exists("data_dir"), data_dir, "data_dir not set"))
-message("Parameter row (param_row): ", param_row)
+
 
 
 # ============================================================
@@ -148,20 +142,11 @@ pars <- expand.grid(
   stringsAsFactors = FALSE
 )
 
-# Validate the requested parameter-row index
-if (param_row < 1 || param_row > nrow(pars)) {
-  stop("param_row is outside the parameter grid range.")
-}
 
-# Select the parameter combination to use in this run
-pars_to_use <- pars[param_row, , drop = FALSE]
 
-if(pars_to_use$method %in% "gam") get_env_covs <- TRUE
+
 # Source the pipeline preparation scripts (they must exist under scripts/pipeline/)
 source(file.path("scripts", "pipeline", "01_dataPreparation", "01_prepData.R"))
-if(get_env_covs){
-source(file.path("scripts", "pipeline", "01_dataPreparation", "02_prepPredictionRaster.R"))
-}
 source(file.path("scripts", "pipeline", "01_dataPreparation", "03_predictionCoords.R"))
 
 if (checks) {
@@ -206,7 +191,26 @@ or_results <- dmodel %>%
   ) %>%
   sf::st_drop_geometry()
 
+# default parameter-row index (overridden by command-line argument on server)
 
+# default only if not already defined
+#if (!exists("param_row")) {
+for(param_row in 1:12){
+ # param_row <- 1
+  #}
+message("Parameter row (param_row): ", param_row)
+# Validate the requested parameter-row index
+if (param_row < 1 || param_row > nrow(pars)) {
+  stop("param_row is outside the parameter grid range.")
+}
+
+# Select the parameter combination to use in this run
+pars_to_use <- pars[param_row, , drop = FALSE]
+if(get_env_covs){
+  source(file.path("scripts", "pipeline", "01_dataPreparation", "02_prepPredictionRaster.R"))
+}
+
+if(pars_to_use$method %in% "gam") get_env_covs <- TRUE
 
 # Convert to a list for passing into the model-fitting function
 pars_to_use_list <- list(
@@ -304,7 +308,7 @@ tryCatch({
       study_region = tare %>% select(geometry), # %>% st_union(),
       path_for_processed_data = path_for_processed_data,
       modelCrs = modelCrs,
-      thinning_distance = 10
+      thinning_distance = 0
     )
 
     saved_files <- save_inla_results(
@@ -358,4 +362,4 @@ tryCatch({
 
 # End of script
 # ============================================================
-#}
+}
