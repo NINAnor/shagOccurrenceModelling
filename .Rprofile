@@ -31,7 +31,7 @@ if (tolower(run_env) == "nina") {
 if (tolower(run_env) == "nina") {
   data_dir <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_KelpHarvest/kwaku/dataset"
 } else {
-  data_dir_env <- Sys.getenv("DATA_DIR", unset = NA_character_)
+  data_dir_env <- "C:/ninaProjects/ninaDernhard" #Sys.getenv("DATA_DIR", unset = NA_character_)
   data_dir <- path.expand(data_dir_env)
 }
 

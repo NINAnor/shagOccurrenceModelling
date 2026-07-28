@@ -26,150 +26,258 @@ execute:
 link-citations: true
 ---
 
+```{r pred_data}
+#| echo: false
+
+setwd(here::here())
+
+
+version_number <- 2      # increment for new published runs
+checks <- FALSE           # run extra exploratory checks if TRUE
+seed <- 1994              # model RNG seed for reproducibility
+
+library(ggplot2)
+library(tidyterra)
+
+
+# ============================================================
+# 1. Load environment, command-line args, and basic paths
+# ============================================================
+# Load project-local environment variables (if present)
+if (file.exists(".Renviron")) readRenviron(".Renviron")
+if (file.exists(".Rprofile")) source(".Rprofile")
+
+# If run_env is not defined, warn the user and assume "personal"
+if (!exists("run_env")) {
+  run_env <- "personal"
+  warning("run_env not found in .Rprofile/.Renviron: assuming 'personal'.")
+
+  readRenviron("C:/Users/kwaku.adjei/.Renviron")
+  source("C:/Users/kwaku.adjei/.Rprofile")
+}
+
+# On non-personal environments (e.g., a server), read command-line args
+if (!run_env %in% "personal") {
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) > 0) {
+    param_row <- as.numeric(args[1])
+  }
+}
+
+# Print core paths (assumes these are defined in .Rprofile)
+message("Working directory: ", ifelse(exists("project_dir"), project_dir, "project_dir not set"))
+message("Temporary directory: ", ifelse(exists("temp_dir"), temp_dir, "temp_dir not set"))
+message("Data directory: ", ifelse(exists("data_dir"), data_dir, "data_dir not set"))
+
+
+
+# ============================================================
+# 2. Output versioning and directories
+# ============================================================
+version_label <- paste0("version_0.1.", version_number)
+
+path_for_processed_data <- file.path(data_dir, version_label)
+dir.create(path_for_processed_data, recursive = TRUE, showWarnings = FALSE)
+
+
+# ============================================================
+# 3. Load packages and project functions
+#    - All function scripts in scripts/functions/ are sourced here.
+# ============================================================
+function_files <- list.files(file.path("scripts", "functions"),
+                             pattern = "\\.R$", full.names = TRUE)
+invisible(lapply(function_files, source))
+
+# Terra/ GDAL threading helper ------------------------------------------------
+# Choose thread counts appropriate for your environment.
+# Example uses 4 terra threads and 1 OpenMP/GDAL thread each.
+if (!run_env %in% "personal") {
+set_terra_threads(n_terra = 4, omp_threads = 1, gdal_threads = 1)
+
+# Helper to consistently set terra write options with GDAL multithreading
+terra_wopt_mt <- function(comp = "LZW", threads = NULL) {
+  if (is.null(threads)) threads <- Sys.getenv("GDAL_NUM_THREADS", unset = "ALL_CPUS")
+  terra::wopt(gdal = c(
+    paste0("COMPRESS=", comp),
+    "PREDICTOR=2",
+    paste0("NUM_THREADS=", threads),
+    "TILED=YES",
+    "BIGTIFF=IF_SAFER"
+  ))
+}
+}
+
+
+# ============================================================
+# 4. Load and prepare input data (pipeline scripts)
+# ============================================================
+# These scripts should prepare the following objects (examples):
+#  - dmodel: the model dataset (points with covariates and response)
+#  - pred_grid / pred_coords: prediction grid for spatial predictions
+#  - study_region: polygon for the study area
+#  - env_stack_10m, raster_results_23/24: environmental rasters/stacks
+# Adjust file paths according to your project layout.
+
+rerunDataFormat <- FALSE
+if (rerunDataFormat) unlink(file.path(path_for_processed_data, "dmodel.RData"))
+
+# Sampling and buffering parameters used by the preparation scripts:
+n_per_point <- 2       # number of random background points per used point
+ID_buffer_m <- 10000    # individual ID buffer (meters)
+harvest_buffer <- 50    # harvest buffer (meters)
+thin_dist_km <- 1
+min_frac_in_bg <- 0.25
+thin_occ <- FALSE
+harvest_stratify <- FALSE
+weight_background_by_area <- FALSE
+group_by_ID <- TRUE
+modelCrs <- 32633
+importFile <- "raster" # options: raster or parquet
+get_env_covs <- FALSE
+
+pars <- expand.grid(
+  Year = c("2023", "2024"),
+  sex = c("Female", "Male"),
+  harvesttimeSK24 = c("afterJuneHarvest", "beforeJuneHarvest", "duringJuneHarvest"),
+  method = c("inla","gam"),
+  stringsAsFactors = FALSE
+)
+
+
+
+
+# Source the pipeline preparation scripts (they must exist under scripts/pipeline/)
+source(file.path("scripts", "pipeline", "01_dataPreparation", "01_prepData.R"))
+source(file.path("scripts", "pipeline", "01_dataPreparation", "03_predictionCoords.R"))
+
+# Validate the requested parameter-row index
+param_row <- 1
+if (param_row < 1 || param_row > nrow(pars)) {
+  stop("param_row is outside the parameter grid range.")
+}
+
+# Select the parameter combination to use in this run
+pars_to_use <- pars[param_row, , drop = FALSE]
+if(get_env_covs){
+  source(file.path("scripts", "pipeline", "01_dataPreparation", "02_prepPredictionRaster.R"))
+}
+
+if(pars_to_use$method %in% "gam") get_env_covs <- TRUE
+
+# Convert to a list for passing into the model-fitting function
+pars_to_use_list <- list(
+  Year = pars_to_use$Year
+)
+
+if(pars_to_use$Year == 2023){
+proj_file <- file.path(
+      path_for_processed_data,
+      "cov_stack_proj_2023.tif"
+    )
+} else {
+  proj_file <- file.path(
+      path_for_processed_data,
+      "cov_stack_proj_2024.tif"
+    )
+}
+
+  
+pres_sf <- dmodel |>
+    dplyr::filter(
+      Year == pars_to_use$Year,
+      sex == pars_to_use$sex,
+      harvesttimeSK24 == pars_to_use$harvesttimeSK24,
+      random == 1
+    )
+
+cov_stack <- terra::rast(proj_file)
+
+dataForModel <- pres_sf |>
+  dplyr::select(-c(harvested200m, DistNest)) 
+
+dataForModel <- terra::extract(cov_stack, terra::vect(dataForModel))  %>%
+  dplyr::select(DistNest, bathymetry, harvested200m) %>%
+  dplyr::mutate(harvested200m = as.factor(harvested200m)) %>%
+  bind_cols(dataForModel, .)
+
+data_plot <- dataForModel |>
+  dplyr::filter(random == 1) |>
+  dplyr::mutate(
+    Logger_model = factor(Logger_model),
+    Year = factor(Year),
+    ID = factor(ID)
+  ) |>
+  dplyr::select(
+    Logger_model,
+    harvested200m,
+    DistNest,
+    bathymetry
+  ) |>
+  sf::st_drop_geometry()
+```
+
 # Introduction
 
-Understanding how European shags use the marine environment requires accounting for both environmental heterogeneity and the strong spatial structure inherent in animal tracking data. Traditional habitat-selection approaches often model used and available locations using logistic regression or generalized additive models (GAMs). While useful, such models do not explicitly represent the underlying spatial point process that generates animal locations.
+Understanding how European shags use the marine environment requires accounting for both environmental conditions and the fact that animal tracking locations are not randomly distributed. Individual birds often return repeatedly to the same foraging areas, resulting in clusters of observations around preferred habitats and breeding colonies.
 
-To address this limitation, we model shag occurrences using a **Log-Gaussian Cox Process (LGCP)** fitted with **INLA** [@inla] and **inlabru** [@inlabru]. An LGCP treats observations as realizations of a spatial point process whose intensity varies continuously across space as a function of environmental covariates and latent spatial structure.
+Many commonly used habitat-selection methods compare observed locations with a set of randomly generated "available" locations (sometimes called pseudo-absences). However, the results of these approaches can depend on how the available locations are generated and how many are included in the analysis [@renner2015point].
 
-The objective of the model is to estimate how occurrence intensity changes in relation to:
+To avoid these limitations, we modelled shag locations using a **log-Gaussian Cox process (LGCP)** fitted with the **INLA** framework [@inla] through the **inlabru** package [@inlabru]. Rather than comparing observed locations with randomly generated absences, an LGCP models the spatial distribution of observations directly across the study area.
 
-- Distance to nest colonies (`DistNest`);
-- Distance to harvested kelp areas (`DistHarvest`);
-- Bathymetry (`bathymetry`);
-- Residual spatial processes not explained by measured covariates.
+The model was used to estimate how the occurrence of foraging shags changed in relation to:
 
-This framework allows ecological drivers and unexplained spatial variability to be modelled simultaneously. 
+- distance to the nearest breeding colony (`DistNest`);
+- distance to the nearest harvested kelp area (`DistHarvest`);
+- water depth (`bathymetry`);
+- differences among individual birds (`ID`);
+- differences among GPS logger models (`Logger_model`); and
+- unexplained spatial variation not captured by the measured environmental variables.
 
-For further details of the LGCPs, we refer to @gomez2020bayesian, @zuur2017beginner and @blangiardo2015spatial.
+This approach allows the effects of environmental variables to be estimated while accounting for natural differences among birds and the tendency for nearby observations to be more similar than those farther apart.
+
+Further details of LGCP models can be found in @gomez2020bayesian, @zuur2017beginner and @blangiardo2015spatial.
 
 # Ecological rationale
 
-Shag observations are highly clustered in space because individuals repeatedly visit preferred foraging habitats and locations near breeding colonies.
+GPS tracking data are typically clustered because individual shags repeatedly forage in the same areas, particularly near breeding colonies. As a result, nearby observations are often more similar than those farther apart, and some parts of the study area are sampled much more intensively than others.
 
-Consequently, observed locations typically exhibit:
+Ignoring these characteristics can lead to misleading conclusions about habitat preferences. The LGCP framework addresses this by modelling the spatial distribution of observations directly while accounting for both measured environmental variables and any remaining spatial patterns that are not explained by those variables.
 
-- strong environmental structure;
-- spatial autocorrelation;
-- unequal sampling intensity across the landscape.
-
-Ignoring these characteristics can lead to biased estimates of habitat selection.
-
-The LGCP framework naturally accommodates clustered point patterns by modelling the intensity of occurrence directly rather than modelling presences and pseudo-absences.
 
 # Point-process model formulation
 
-Let $s$ denote a location within the study region.
+## Model assumptions
 
-The occurrence intensity at location $s$ is modelled as:
+The LGCP model relies on several assumptions about the data and the underlying ecological process.
 
-$$
-\lambda(s)=\exp(\eta(s))
-$$
+1. **Observed locations represent a spatial point process.**
 
-where:
+   The GPS locations are assumed to be observations from an underlying spatial process in which the probability of observing a shag varies across the study area rather than being constant everywhere [@illian2008statistical; @rue2009approximate; @@johnson2006resource].
 
-- $\lambda(s)$ is the expected occurrence intensity;
-- $\eta(s)$ is the linear predictor.
+2. **Environmental variables explain part of the spatial variation.**
 
-Higher values of $\lambda(s)$ indicate locations that are expected to be used more frequently.
+   The occurrence intensity is assumed to change as a function of the measured environmental variables, including distance to breeding colonies, distance to harvested kelp areas, and bathymetry.
+
+3. **Not all spatial variation can be measured.**
+
+   Environmental variables rarely explain all of the observed spatial patterns. The model therefore includes a spatial random field that accounts for residual spatial structure arising from unmeasured habitat characteristics or other ecological processes.
+
+4. **Spatial dependence decreases with distance.**
+
+   Locations that are close together are assumed to be more similar than locations farther apart. This residual spatial dependence is modelled using a Matérn covariance function, which estimates both the spatial scale (range) and the magnitude (variance) of the remaining spatial variation.
+
+5. **Differences among birds and logger models are accounted for.**
+
+   Individual birds may differ in their behaviour, and different logger models may produce slightly different observation patterns. Random effects are included to account for these sources of variation so that estimates of habitat relationships are not confounded by differences among individuals or devices.
+
+6. **Observations are conditionally independent.**
+
+   After accounting for the measured environmental variables, the spatial random field, and the random effects, the remaining observations are assumed to be independent of one another [@illian2008statistical].
 
 
-The linear predictor of the full spatial model is:
+## Checking model assumptions
 
-$$
-\eta(s)
-=
-\beta_0
-+
-\beta_1 DistNest(s)
-+
-\beta_2 DistHarvest(s)
-+
-\beta_3 Bathymetry(s)
-+
-w(s)
-$$
-
-where:
-
-- $\beta_0$ is the intercept;
-- $\beta_1$ represents the effect of distance to nest colonies;
-- $\beta_2$ represents the effect of distance to harvested areas;
-- $\beta_3$ represents the effect of bathymetry;
-- $w(s)$ is a spatially structured Gaussian random field.
-
-Interpretation of coefficient signs is straightforward:
-
-- Negative `DistNest` coefficients indicate selection for areas closer to colonies.
-- Negative `DistHarvest` coefficients indicate selection for areas closer to harvested kelp regions.
-- Positive `DistHarvest` coefficients indicate avoidance of harvested regions.
-- Positive bathymetry coefficients indicate increased occurrence intensity with increasing bathymetry values.
-
-# Environmental covariates
-
-Three environmental predictors were included.
-
-## Distance to nest colonies
-
-```r
-DistNest
-```
-
-This raster represents the distance from each location to the nearest nesting colony.
-
-The ecological expectation is that occurrence intensity declines with increasing distance from colonies because commuting costs increase with travel distance.
-
-## Distance to harvested kelp areas
-
-```r
-DistHarvest
-```
-
-This raster measures the distance from each location to the nearest harvested kelp area.
-
-The sign and magnitude of this coefficient provide direct evidence regarding attraction toward or avoidance of harvested regions.
-
-## Bathymetry
-
-```r
-bathymetry
-```
-
-Bathymetry represents depth-related characteristics of the marine environment and is included to account for known relationships between shag foraging behaviour and seabed structure.
-
-## Covariate preprocessing
-
-All continuous covariates are standardised before model fitting:
-
-$$
-z_i = \frac{x_i-\mu}{\sigma}
-$$
-
-where:
-
-- $\mu$ is the mean;
-- $\sigma$ is the standard deviation.
-
-Standardisation provides several advantages:
-
-- comparable coefficient magnitudes;
-- improved numerical stability;
-- easier interpretation of effect sizes;
-- better prior specification.
-
-Following standardisation, a coefficient represents the effect of a one-standard-deviation change in a predictor.
-
-# Presence data
-
-Occurrence locations were obtained from the tracking dataset ([see details here]()) and filtered according to:
-
-- Year;
-- Sex;
-- Harvest period.
-
-For example:
-
+Occurrence locations were obtained from the GPS tracking data ([see details here](https://github.com/NINAnor/shagOccurrenceModelling/blob/main/vignettes/supplementary_methods.qmd)) and filtered by year, sex, and harvest period before modelling. For example:
 ```r
 pres_sf <- dmodel |>
   filter(
@@ -180,247 +288,766 @@ pres_sf <- dmodel |>
   )
 ```
 
-Only observed locations were retained for point-process modelling.
+Because GPS devices record animal locations at regular time intervals, successive observations from the same bird often occur at exactly the same location or only a few metres apart. Such repeated observations violate the assumption that each location represents an independent use of habitat and can give undue weight to frequently visited locations.
+```{r duplicate_pts}
+# Drop the levels,
+  #so that the number of levels of the ID are equal to the unique number of elements
+  pres_sf$ID <- droplevels(pres_sf$ID)
 
-## Duplicate removal
+  # Ccheck the distinct presence occurrences for each shag
+  coords <- sf::st_coordinates(pres_sf)
 
-Exact duplicate coordinates can occur due to repeated GPS fixes at identical locations.
+pres_sf_check <- pres_sf |>
+  dplyr::mutate(
+    X = coords[, 1],
+    Y = coords[, 2]
+  )
 
-Duplicates were removed before model fitting:
 
-```r
-distinct(X, Y, .keep_all = TRUE)
+pres_sf_check |>
+  dplyr::count(ID, X, Y) |>
+  dplyr::summarise(
+    duplicated_locations = sum(n > 1),
+    duplicated_observations = sum(n[n > 1]),
+    max_repeats = max(n)
+  )
 ```
 
-This ensures that each coordinate contributes only once to the likelihood.
+We therefore first quantified the number of duplicated locations for each individual bird. Duplicate observations at identical coordinates were then removed while retaining observations from different birds or logger models at the same location. This ensured that each location represented a unique observation for each bird and logger combination.
+```{r duplicate_unique_pts}
+  # Ccheck the distinct presence occurrences for each shag
+  coords <- sf::st_coordinates(pres_sf)
 
-## Spatial thinning
+  pres_sf_unique <- pres_sf %>%
+    dplyr::mutate(
+      X = coords[, 1],
+      Y = coords[, 2]
+    ) %>%
+    dplyr::distinct(ID, Logger_model, X, Y, .keep_all = TRUE)
 
-### Motivation
+pres_sf_unique |>
+dplyr::count(ID, X, Y) |>
+  dplyr::summarise(
+    duplicated_locations = sum(n > 1),
+    duplicated_observations = sum(n[n > 1]),
+    max_repeats = max(n)
+  )
+```
 
-Animal tracking data often contain large numbers of observations separated by only a few metres.
+To further evaluate the spatial structure of the tracking data, we examined nearest-neighbour distances between observations (@fig-neareastNeighbors). Most locations occurred only a few meters from another observation, indicating that the tracking data were highly clustered, as expected for central-place foraging seabirds.
+```{r nearest_neighbors}
+#| echo: false
+#| message: false
+#| fig-cap: "Distance of nearest neigbors in metres for the observed shag occurrences."
+#| label: fig-neareastNeighbors
 
-These observations are not independent and can dominate model estimation.
 
-Spatial thinning was therefore applied to reduce redundancy and improve inference.
+library(spatstat.geom)
+window <- as.owin(st_geometry(study_region))
+pp <- as.ppp(st_coordinates(pres_sf), W = window)
 
-### Thinning procedure
+nnd <- nndist(pp)
 
-A minimum separation distance was imposed between retained observations.
+hist(
+  nnd,
+  breaks = 100,
+  main = "Nearest-neighbor distances",
+  xlab = "Distance (m)"
+)
+```
 
-Several thinning distances were explored:
+We also calculated Ripley's $K$ function (@fig-ripleyKFunction), which compares the observed degree of clustering with that expected if locations were randomly distributed across the study area. The observed point pattern showed substantially stronger clustering than expected under complete spatial randomness over distances of approximately $12 - 13$ km. The strongest clustering occurred within the first $2 - 3$ km, reflecting repeated use of nearby foraging areas by individual birds.
+```{r}
+#| echo: false
+#| message: false
+#| fig-cap: "Ripley's K-function estimates for the observed data."
+#| label: fig-ripleyKFunction
+library(sf)
+library(ggplot2)
 
-| Distance | Retained observations |
-|-----------|-----------:|
-| None | 2140 |
-| 500 m | 162 |
-| 1000 m | 76 |
-| 5000 m | 14 |
+##------------------------------------------------------------
+## Ripley's K-function without spatstat
+##------------------------------------------------------------
+compute_ripley_k <- function(points_sf,
+                             study_region,
+                             r = NULL,
+                             nbreaks = 100) {
 
-The 1000-m thinning distance was ultimately selected because it provided a balance between reducing spatial clustering and retaining sufficient sample size.
+  stopifnot(inherits(points_sf, "sf"))
+  stopifnot(inherits(study_region, "sf"))
 
-Importantly, comparisons of environmental distributions before and after thinning demonstrated that thinning reduced spatial redundancy while preserving habitat composition.
+  coords <- st_coordinates(points_sf)
+
+  n <- nrow(coords)
+
+  if (n < 2)
+    stop("Need at least two points.")
+
+  ## Area of observation window
+  area <- as.numeric(sum(st_area(study_region)))
+
+  ## Pairwise distances
+  D <- as.matrix(dist(coords))
+
+  ## Remove self-distances
+  diag(D) <- Inf
+
+  ## Distance sequence
+  if (is.null(r)) {
+    maxdist <- min(diff(range(coords[,1])),
+                   diff(range(coords[,2]))) / 2
+
+    r <- seq(0, maxdist, length.out = nbreaks)
+  }
+
+  ## Compute K(r)
+  K <- numeric(length(r))
+
+  for(i in seq_along(r)){
+
+    count <- sum(D <= r[i])
+
+    ## divide by n because every pair counted twice
+    K[i] <- area * count / (n * (n - 1))
+  }
+
+  data.frame(
+    r = r,
+    K = K,
+    CSR = pi * r^2
+  )
+}
+
+Kdf <- compute_ripley_k(
+  points_sf = pres_sf,
+  study_region = study_region
+)
+
+ggplot(Kdf, aes(r)) +
+  geom_line(aes(y = K), linewidth = 1) +
+  geom_line(aes(y = CSR),
+            linetype = 2,
+            colour = "red") +
+  labs(
+    x = "Distance (m)",
+    y = "Ripley's K(r)"
+  ) +
+  theme_bw()
+```
+
+These analyses confirmed that the observations were spatially clustered and justified the inclusion of a spatial component in the habitat selection models.
+
+## Model specification
+
+The LGCP model estimates how the expected occurrence of foraging shags changes across the study area as a function of environmental conditions while accounting for differences among individual birds and residual spatial structure.
+
+The expected occurrence intensity at location $s$ is modelled as:
+$$
+\lambda(s)=\exp(\eta(s))
+$$
+where larger values of $\lambda(s)$ indicate locations that are predicted to be used more frequently.
+
+The linear predictor for the full spatial model was:
+$$
+\eta(s_i)
+=
+\beta_0
++
+\beta_1 DistNest(s_i)
++
+\beta_2 DistHarvest(s_i)
++
+\beta_3 Bathymetry(s_i)
++
+\beta_{ID(i)} +
+\beta_{Logger(i)} +
+w(s_i)
+$$
+where:
+
+- $\beta_0$ is the intercept;
+- $\beta_1$ represents the effect of distance to nest colonies;
+- $\beta_2$ represents the effect of distance to harvested areas;
+- $\beta_3$ represents the effect of bathymetry;
+- $\beta_{ID(i)} \sim N(0, \sigma_{ID}^2)$ is the random intercept for individual bird $i$;
+- $\beta_{Logger(i)} \sim N(0, \sigma_{Logger}^2)$ is the random intercept for logger model;
+- $w(s_i)$ is a spatially structured Gaussian random field.
+
+The model included three environmental covariates describing the distance to the nearest breeding colony, distance to the nearest harvested kelp area, and water depth. Random effects were included to account for consistent differences among individual birds and between GPS logger models. A spatial random field captured any remaining spatial variation that could not be explained by the measured environmental variables.
+
+Interpretation of coefficient signs is straightforward:
+
+- Negative `DistNest` coefficients indicate selection for areas closer to colonies.
+- Negative `DistHarvest` coefficients indicate avoidance of harvested regions.
+- Positive `bathymetry` coefficients indicate increased occurrence intensity with increasing bathymetry values.
+
+Our primary parameter of interest was the effect of distance to harvested kelp areas ($\beta_2$), which quantified how shag occurrence changed in relation to kelp harvesting after accounting for the other environmental variables.
+
+# Environmental covariates
+
+## Covariate preprocessing
+
+All continuous environmental covariates were standardised before model fitting by subtracting their mean and dividing by their standard deviation,
+$$
+z_i=\frac{x_i-\mu}{\sigma}.
+$$
+
+Standardisation places all variables on the same scale, making model estimation more stable and allowing the estimated effects of different covariates to be compared directly. Consequently, each regression coefficient represents the expected change in occurrence associated with a one-standard-deviation change in the corresponding environmental variable.
+
+```{r plot_distribution}
+#| echo: false
+#| message: false
+#| fig-cap: "Exploratory relationships among the principal covariates included in the habitat selection models. Top row: distributions of scaled distance to nest (DistNest) and scaled bathymetry by logger model. Middle row: distributions of the same covariates by kelp harvest status within 200 m of each location. Bottom left: relationship between bathymetry and distance to nest coloured by logger model. Bottom right: proportional distribution of harvested and non-harvested locations across logger models."
+#| label: fig-distribution
+#| fig-height: 8
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+theme_set(theme_bw(base_size = 12))
+
+cols <- c(
+  "CEFAS" = "#E69F00",
+  "Ornitela" = "#0072B2"
+)
+
+##--------------------------------------------------
+## 1. DistNest vs Logger model
+##--------------------------------------------------
+
+p1 <- ggplot(
+  data_plot,
+  aes(
+    x = Logger_model,
+    y = DistNest,
+    fill = Logger_model
+  )
+) +
+  geom_violin(
+    alpha = 0.4,
+    colour = NA
+  ) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    alpha = 0.8
+  ) +
+  scale_fill_manual(values = cols) +
+  labs(
+    x = NULL,
+    y = "Scaled distance to nest"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+##--------------------------------------------------
+## 2. Bathymetry vs Logger model
+##--------------------------------------------------
+
+p2 <- ggplot(
+  data_plot,
+  aes(
+    Logger_model,
+    bathymetry,
+    fill = Logger_model
+  )
+) +
+  geom_violin(
+    alpha = 0.4,
+    colour = NA
+  ) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA
+  ) +
+  scale_fill_manual(values = cols) +
+  labs(
+    x = NULL,
+    y = "Scaled bathymetry"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+##--------------------------------------------------
+## 3. DistNest vs harvested200m
+##--------------------------------------------------
+
+p3 <- ggplot(
+  data_plot,
+  aes(
+    harvested200m,
+    DistNest,
+    fill = harvested200m
+  )
+) +
+  geom_boxplot() +
+  scale_fill_brewer(
+    palette = "Set2"
+  ) +
+  labs(
+    x = "Harvest within 200 m",
+    y = "Scaled distance to nest"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+##--------------------------------------------------
+## 4. Bathymetry vs harvested200m
+##--------------------------------------------------
+
+p4 <- ggplot(
+  data_plot,
+  aes(
+    harvested200m,
+    bathymetry,
+    fill = harvested200m
+  )
+) +
+  geom_boxplot() +
+  scale_fill_brewer(
+    palette = "Set2"
+  ) +
+  labs(
+    x = "Harvest within 200 m",
+    y = "Scaled bathymetry"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+##--------------------------------------------------
+## 5. DistNest vs Bathymetry
+##--------------------------------------------------
+
+p5 <- ggplot(
+  data_plot,
+  aes(
+    DistNest,
+    bathymetry,
+    colour = Logger_model
+  )
+) +
+  geom_point(
+    alpha = 0.6,
+    size = 1.3
+  ) +
+  scale_colour_manual(values = cols) +
+  labs(
+    x = "Scaled distance to nest",
+    y = "Scaled bathymetry",
+    colour = "Logger model"
+  )
+
+##--------------------------------------------------
+## 6. Logger model vs harvested200m
+##--------------------------------------------------
+
+p6 <- ggplot(
+  data_plot,
+  aes(
+    Logger_model,
+    fill = harvested200m
+  )
+) +
+  geom_bar(
+    position = "fill"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent
+  ) +
+  scale_fill_brewer(
+    palette = "Set2",
+    name = "Harvest\nwithin 200 m"
+  ) +
+  labs(
+    x = "Logger model",
+    y = "Proportion"
+  )
+
+##--------------------------------------------------
+## Combine
+##--------------------------------------------------
+
+plot_covariates <-
+  (p1 | p2) /
+  (p3 | p4) /
+  (p5 | p6)
+
+plot_covariates
+```
+
+@fig-distribution summarises the distributions of the environmental covariates included in the habitat selection models. The two GPS logger types sampled broadly similar environmental conditions, although Ornitela loggers tended to record locations slightly closer to breeding colonies and in somewhat deeper water than CEFAS loggers. Despite these differences, there was substantial overlap between logger types, indicating that both devices sampled similar habitats.
+
+Comparisons between harvested and non-harvested areas showed clearer environmental differences. Locations within 200 m of harvested kelp were generally closer to breeding colonies and occurred in shallower water than locations farther from harvested areas. In contrast, non-harvested locations spanned a wider range of distances from colonies and water depths, indicating greater environmental variability.
+
+Distance to breeding colonies and bathymetry were moderately related, with locations closer to colonies tending to occur in slightly deeper water. However, the relationship was weak enough to suggest that each variable captured different aspects of habitat use and therefore provided complementary information for the models.
+
+Finally, only a small proportion of observations occurred within 200 m of harvested kelp for either logger type. This suggests that both logger models sampled harvested and non-harvested habitats in a similar manner, reducing the likelihood that differences between logger types influenced the estimated habitat relationships.
+
+## Covariates used in the habitat selection models
+
+We selected three environmental variables that are expected to influence the distribution of foraging European shags. Together, these variables describe the energetic costs of travelling from breeding colonies, potential effects of kelp harvesting, and the physical characteristics of the marine environment.
+
+### Distance to breeding colonies (`DistNest`)
+
+```{r dist_colony}
+#| echo: false
+#| fig-cap: "Distance to the nearest breeding colony. Observed shag locations are shown in red."
+#| label: fig-distColony
+ggplot() +
+  geom_spatraster(
+    data = cov_stack[["DistNest"]],
+    aes(fill = DistNest)
+  ) +
+  geom_sf(
+    data = pres_sf,
+    colour = "red",
+    size = 0.3,
+    alpha = 0.5
+  ) +
+  scale_fill_viridis_c(
+    name = "DistNest",
+    na.value = "transparent"
+  ) +
+  coord_sf() +
+  theme_bw()
+```
+
+The distance-to-nest raster describes the distance from every location within the study area to the nearest breeding colony (@fig-distColony). European shags are central-place foragers during the breeding season and repeatedly return to their nests to provision chicks. Consequently, locations close to breeding colonies are expected to be used more frequently than distant locations because travelling longer distances increases the energetic cost of foraging. This variable therefore tests whether shag occurrence decreases with increasing distance from breeding colonies.
+
+### Distance to harvested kelp areas (`DistHarvest`)
+
+```{r dist_harvested_areas}
+#| echo: false
+#| fig-cap: "Harvested kelp areas (within a 200 m buffer) with observed shag locations shown in red."
+#| label: fig-distHarvestedAreas
+ggplot() +
+  geom_spatraster(
+    data = cov_stack[["harvested200m"]],
+    aes(fill = harvested200m)
+  ) +
+  geom_sf(
+    data = pres_sf,
+    colour = "red",
+    size = 0.3,
+    alpha = 0.5
+  ) +
+  scale_fill_viridis_c(
+    name = "Harvested",
+    na.value = "transparent"
+  ) +
+  coord_sf() +
+  theme_bw()
+```
+
+The distance-to-harvest raster measures the distance from each location to the nearest harvested kelp area (@fig-distHarvestedAreas).
+
+This variable addresses the primary ecological question of the study: **does kelp harvesting influence where shags forage?**
+
+If shags avoid harvested kelp forests, occurrence is expected to decrease close to harvested areas. Conversely, if harvested areas provide suitable foraging habitat, occurrence may increase near harvesting. The estimated effect therefore quantifies whether shags show evidence of avoidance, preference, or no detectable response to kelp harvesting.
+
+### Bathymetry (`bathymetry`)
+
+```{r bathymetry}
+#| echo: false
+#| fig-cap: "Bathymetry of the study area with observed shag locations shown in red."
+#| label: fig-bathymetry
+ggplot() +
+  geom_spatraster(
+    data = cov_stack[["bathymetry"]],
+    aes(fill = bathymetry)
+  ) +
+  geom_sf(
+    data = pres_sf,
+    colour = "red",
+    size = 0.3,
+    alpha = 0.5
+  ) +
+  scale_fill_viridis_c(
+    name = "Bathymetry",
+    na.value = "transparent"
+  ) +
+  coord_sf() +
+  theme_bw()
+```
+Bathymetry describes the depth of the marine environment across the study area (@fig-bathymetry). Water depth influences seabed characteristics, prey availability, and diving opportunities for shags. Including bathymetry in the model allows us to account for these natural habitat preferences when evaluating the effects of distance to breeding colonies and kelp harvesting.
 
 # Spatial mesh construction and Spatial random field
 
-## Spatial mesh construction 
+## Spatial mesh
 
-The SPDE approach approximates the continuous spatial field using a finite-element mesh.
+The spatial component of the model was represented using the Stochastic Partial Differential Equation (SPDE) approach. This method approximates the continuous spatial surface with a network of connected triangles, referred to as a **mesh** (@fig-mesh).
+```{r mesh}
+#| echo: true
+#| fig-cap: "Finite-element mesh used to represent the spatial random field."
+#| label: fig-mesh
+  mesh_builder <- create_fmesher_mesh_from_locations(
+    points_sf = pres_sf,
+    study_region_sf = tare %>% select(geometry),
+    target_crs = modelCrs,
+    offset = c(500, 1000),
+    max_edge = c(15000, 30000),
+    cutoff = 0
+  )
 
-The mesh was constructed using observed locations and the study region boundary.
-
-```r
-mesh_builder <- create_fmesher_mesh_from_locations(
-  points_sf = pres_sf,
-  study_region_sf = study_region,
-  target_crs = modelCrs,
-  offset = c(2000, 10000),
-  max_edge = c(3000, 10000),
-  cutoff = 1000
-)
+  mesh <- mesh_builder$mesh
+  study_region <- mesh_builder$study_region
+  plot(mesh)
 ```
 
-### Offset
+The mesh determines the spatial resolution at which the model estimates broad-scale spatial patterns.
 
-The mesh extends beyond the study area boundary using:
+### Mesh extension
 
+The mesh was extended beyond the study-area boundary
 ```r
-offset = c(2000,10000)
+offset = c(500,1000)
 ```
+to reduce edge effects and improve estimation of the spatial field near the boundaries of the study area.
 
-to reduce edge effects during estimation.
+### Mesh resolution
 
-### Maximum edge length
+The maximum triangle size was specified as
+This provides sufficient spatial resolution while keeping model fitting computationally efficient.
 
+### Point spacing
+
+Because the tracking locations were retained after removing duplicate observations rather than applying additional spatial thinning, no minimum separation distance between neighbouring mesh nodes was imposed:
 ```r
-max_edge = c(3000,10000)
+cutoff = 0
 ```
-
-controls triangle size and therefore the spatial resolution of the latent field.
-
-### Cutoff
-
-```r
-cutoff = 1000
-```
-
-prevents excessive mesh density around clusters of observations.
 
 ## Spatial random field
 
-A Matérn Gaussian random field was used to model residual spatial dependence.
+Animal tracking data commonly exhibit spatial patterns that cannot be fully explained by measured environmental variables alone. Nearby locations are often more similar than distant locations because of unmeasured habitat characteristics or behavioural processes.
 
-### SPDE specification
+To account for this residual spatial structure, the model included a spatial random field based on the SPDE approach.
 
-```r
-spde <- inla.spde2.pcmatern(
-  mesh = mesh,
-  alpha = 2,
-  prior.range = c(3000, 0.5),
-  prior.sigma = c(0.5, 0.01)
-)
+### Prior specification
+
+The spatial model requires prior distributions for two parameters:
+
+- the **spatial range**, which describes the distance over which locations remain spatially related; and
+- the **spatial standard deviation**, which describes the magnitude of the remaining unexplained spatial variation.
+
+These priors were generated automatically using the study-area extent:
+```{r}
+#| echo: false
+
+  priors <- choose_pc_priors_binomial(study_region)
+
+  # cat("r0 =", priors$prior.range[1], "\n")
+  # cat("P(range < r0) =", priors$prior.range[2], "\n")
+  # 
+  # cat("s0 =", priors$prior.sigma[1], "\n")
+  # cat("P(sigma > s0) =", priors$prior.sigma[2], "\n")
+
+  spde <- inla.spde2.pcmatern(
+    mesh = mesh,
+    alpha = 2,
+    prior.range = priors$prior.range,
+    prior.sigma = priors$prior.sigma
+  )
 ```
 
-### Range prior
+### Prior for the spatial range
 
-The range parameter determines the spatial scale over which locations are correlated.
+A penalized complexity (PC) prior was specified for the spatial range, `r paste0("P(range < ", priors$prior.range[1], " m) = ", priors$prior.range[2])`. This prior favours relatively simple spatial patterns while still allowing the data to support broader spatial dependence when present.
 
-The prior:
+### Prior for the spatial standard deviation
 
-```r
-prior.range = c(3000, 0.5)
-```
+A penalized complexity (PC) prior was specified for the spatial standard deviation, `r paste0("P(sigma > ", priors$prior.sigma[1], ") = ", priors$prior.sigma[2])`. This prior favours little or no residual spatial variation unless the data provide strong evidence for additional spatial structure.
 
-implies
-
-$$
-P(range < 3000 \, m)=0.5
-$$
-
-providing moderate prior support for broad-scale spatial patterns.
-
-### Variance prior
-
-The standard deviation prior:
-
-```r
-prior.sigma = c(0.5,0.01)
-```
-
-implies
-
-$$
-P(\sigma > 0.5)=0.01
-$$
-
-which shrinks the spatial field toward zero in the absence of strong evidence for residual spatial structure.
 
 # Model Fitting
 
 ## Candidate models
 
-Two competing models were fitted.
+To determine which factors best explained the distribution of foraging shags, we fitted three competing log-Gaussian Cox process (LGCP) models. All models included the same environmental covariates:
+
+- Distance to the nearest nest (`DistNest`)
+- Distance to the nearest harvested kelp area (`DistHarvest`)
+- Water depth (`bathymetry`)
+
+The models differed in how they accounted for unexplained variation in the data. Comparing these three models allows us to evaluate the relative importance of different sources of variation in shag distribution. Specifically, we tested whether the observed distribution of shags could be explained by the measured environmental variables alone, whether accounting for differences among individual birds and logger models improved model performance, and whether additional unexplained spatial patterns remained after these factors were considered. 
 
 ### Spatial LGCP
 
-The spatial model included environmental covariates and the SPDE field:
+The spatial model included the environmental covariates together with random effects for individual shags and logger models, and an additional **spatial effect**. This spatial effect accounts for spatial patterns in shag locations that cannot be explained by the measured environmental covariates, such as unmeasured habitat characteristics or other spatially structured processes.
 
 ```r
-~
-Intercept(1) +
-DistNest(main = DistNest) +
-DistHarvest(main = DistHarvest) +
-bathymetry(main = bathymetry) +
-spatial(
-  geometry,
-  model = spde
-)
+cmp_spatial <-
+  ~ Intercept(1) +
+    DistNest(main = DistNest) +
+    DistHarvest(main = DistHarvest) +
+    bathymetry(main = bathymetry) +
+    individual(ID, model = "iid", ...) +
+    loggerModel(Logger_model, model = "iid", ...) +
+    spatial(geometry, model = spde)
 ```
 
 ### Non-spatial LGCP
 
-A simpler model excluded the spatial field:
+The non-spatial model included the same environmental covariates and random effects for individual shags and logger models, but **did not include the spatial effect**. This model assumes that any remaining variation can be explained by differences among birds, logger models, and the measured environmental covariates.
 
 ```r
-~
-Intercept(1) +
-DistNest(main = DistNest) +
-DistHarvest(main = DistHarvest) +
-bathymetry(main = bathymetry)
+cmp_nospatial <-
+  ~ Intercept(1) +
+    DistNest(main = DistNest) +
+    DistHarvest(main = DistHarvest) +
+    bathymetry(main = bathymetry) +
+    individual(ID, model = "iid", ...) +
+    loggerModel(Logger_model, model = "iid", ...)
 ```
 
-Comparing these models allows evaluation of whether environmental covariates alone explain occurrence patterns or whether additional residual spatial structure remains.
+### Environmental LGCP
 
-## Estimation
+The simplest model included only the environmental covariates and did not account for variation among individual birds, logger models, or unexplained spatial structure.
 
-Models were fitted using the Cox-process likelihood:
+```r
+cmp_nospatialindividual <-
+  ~ Intercept(1) +
+    DistNest(main = DistNest) +
+    DistHarvest(main = DistHarvest) +
+    bathymetry(main = bathymetry)
+```
+
+
+## Model fitting
+
+All models were fitted as log-Gaussian Cox process (LGCP) models using the `bru()` interface in the **inlabru** package with a Cox-process likelihood:
 
 ```r
 family = "cp"
 ```
 
-through the `bru()` interface.
-
-Environmental rasters were supplied directly through:
+Environmental covariates were supplied as raster layers:
 
 ```r
 data_extra = cov_env
 ```
 
-rather than attaching raster values to the point data.
+Rather than extracting raster values only at the observed shag locations, the raster layers were provided directly to the model. This allowed environmental values to be extracted consistently at both the observed locations and the integration points used to estimate habitat availability.
 
-This approach ensures that covariate values are extracted consistently at both observation locations and integration points.
+### Integration points
 
-## Integration points
+LGCP models estimate the probability of observing animals by comparing their locations with the habitat available throughout the study area. To achieve this, numerical integration is performed across the entire study region.
 
-Likelihood approximation in LGCP models requires numerical integration across the study region.
-
-Integration points were generated automatically from the mesh and study-area polygon:
+Integration points were generated automatically from the spatial mesh and the study-area boundary:
 
 ```r
-fm_int(mesh,
-       samplers = region_sf)
+fm_int(mesh, samplers = region_sf)
 ```
 
-These points represent habitat availability and provide the quadrature scheme used to approximate the point-process likelihood.
+These integration points represent the available habitat and enable the likelihood of the point process to be approximated across the landscape.
 
 ## Model comparison
 
-Models were compared using:
+The competing models were evaluated using several complementary model selection criteria.
 
-### WAIC
+### Widely Applicable Information Criterion (WAIC)
 
-The Widely Applicable Information Criterion (WAIC) was used as the primary model-selection metric.
+WAIC was used as the primary measure of predictive performance. Lower WAIC values indicate a model with better expected predictive ability while accounting for model complexity.
 
-Lower WAIC values indicate improved predictive performance.
+### Deviance Information Criterion (DIC)
 
-### DIC
-
-The Deviance Information Criterion (DIC) was also computed as a supplementary measure of model fit.
+DIC was calculated as an additional measure of model fit, with lower values indicating a better balance between model fit and complexity.
 
 ### Marginal log-likelihood
 
-Marginal log-likelihood values were examined to evaluate relative model support.
+The marginal log-likelihood was examined as an additional measure of model support, where larger values indicate stronger support for the fitted model.
 
-The preferred model was the one with the lowest WAIC while also producing ecologically interpretable parameter estimates.
+The final model was selected primarily on the basis of WAIC. When competing models had similar WAIC values, ecological interpretability and parameter estimates were also considered in selecting the most appropriate model.
+
+## Model Summary
+
+We present one model summary output for illustration. The presented model is a spatial log-Gaussian Cox process (LGCP) fitted using **inlabru** (v2.14.1.9007) with **INLA** (v25.04.29). The model included fixed effects for distance to the nearest nest (`DistNest`), distance to the nearest harvested kelp area (`DistHarvest`), and bathymetry, together with random intercepts for individual shags and logger models, and a spatial Gaussian random field represented using the SPDE approach.
+
+The estimated effects indicated that:
+
+- **Distance to nests** had a positive effect on occurrence intensity ($\beta = 0.631$).
+- **Distance to harvested kelp** had a negative effect ($\beta = -0.898$), indicating reduced occurrence intensity with increasing distance from harvested areas.
+- **Bathymetry** also had a negative effect ($\beta = -1.010$), indicating lower occurrence intensity as bathymetry increased.
+
+The fitted spatial field had an estimated range of approximately **607 m** and a marginal standard deviation of **10.54**, indicating residual spatial structure remained after accounting for the measured environmental covariates.
+
+The model achieved a WAIC of **850,560**, a DIC of **−17,509,418**, and a marginal log-likelihood of **−22,293,331**.
+
+```text
+inlabru version: 2.14.1.9007 
+INLA version: 25.04.29 
+Latent components:
+Intercept: main = linear(1)
+DistNest: main = linear(DistNest)
+DistHarvest: main = linear(DistHarvest)
+bathymetry: main = linear(bathymetry)
+individual: main = iid(ID)
+loggerModel: main = iid(Logger_model)
+spatial: main = spde(geometry)
+Observation models:
+  Model tag: <No tag>
+    Family: 'cp'
+    Data class: 'sf', 'tbl_df', 'tbl', 'data.frame'
+    Response class: 'numeric'
+    Predictor: geometry ~ Intercept + DistNest + DistHarvest + bathymetry + individual + loggerModel + spatial
+    Additive/Linear/Rowwise: TRUE/TRUE/TRUE
+    Used components: effect[Intercept, DistNest, DistHarvest, bathymetry, individual, loggerModel, spatial], latent[] 
+Time used:
+    Pre = 0.983, Running = 9655, Post = 5.93, Total = 9662 
+Fixed effects:
+              mean    sd 0.025quant 0.5quant 0.975quant   mode kld
+Intercept   -1.068 0.000     -1.069   -1.068     -1.068 -1.068   0
+DistNest     0.631 0.000      0.630    0.631      0.631  0.631   0
+DistHarvest -0.898 0.001     -0.900   -0.898     -0.896 -0.898   0
+bathymetry  -1.010 0.000     -1.011   -1.010     -1.009 -1.010   0
+
+Random effects:
+  Name	  Model
+    individual IID model
+   loggerModel IID model
+   spatial SPDE2 model
+
+Model hyperparameters:
+                            mean    sd 0.025quant 0.5quant 0.975quant   mode
+Precision for individual  162.66 0.001     162.66   162.66     162.66 162.66
+Precision for loggerModel   2.27 0.000       2.27     2.27       2.27   2.27
+Range for spatial         607.33 0.004     607.33   607.33     607.34 607.33
+Stdev for spatial          10.54 0.000      10.54    10.54      10.54  10.54
+
+Deviance Information Criterion (DIC) ...............: -17509418.16
+Deviance Information Criterion (DIC, saturated) ....: -14643482.20
+Effective number of parameters .....................: -16676698.12
+
+Watanabe-Akaike information criterion (WAIC) ...: 850559.95
+Effective number of parameters .................: 7e+05
+
+Marginal log-Likelihood:  -22293330.58 
+ is computed 
+Posterior summaries for the linear predictor and the fitted values are computed
+(Posterior marginals needs also 'control.compute=list(return.marginals.predictor=TRUE)')
+```
 
 ## Prediction
 
-Predictions were generated across a regular grid covering the study region.
+After fitting the best-supported model, predictions were generated across a regular grid covering the entire study area.
 
 ```r
 px <- fm_pixels(
   mesh,
-  dim = c(500,500),
+  dim = c(500, 500),
   mask = region_sf
 )
 ```
 
-Environmental covariate values were extracted for each prediction pixel.
+Environmental covariate values were extracted for every prediction cell, allowing the model to estimate the relative occurrence intensity of shags throughout the study area.
 
-## Distance-to-harvest effect maps
+## Effect of distance from harvested kelp
 
-To isolate the effect of harvesting, predictions were produced using:
+To examine the influence of kelp harvesting independently of the other environmental variables, predictions were generated using only the intercept and the distance-to-harvest effect:
 
 ```r
 pred_dh <- predict(
@@ -433,13 +1060,11 @@ pred_dh <- predict(
 )
 ```
 
-These maps represent the contribution of the harvest-distance covariate alone.
+These maps show how the predicted occurrence of shags changes with distance from harvested kelp areas while all other environmental variables are held constant. They therefore isolate the contribution of the harvesting covariate and provide a direct visualization of whether shags are predicted to avoid or prefer harvested areas.
 
-They should therefore be interpreted as relative intensity surfaces describing how occurrence changes with distance from harvested areas while holding all other predictors constant.
+## Habitat suitability
 
-## Habitat suitability maps
-
-Full environmental predictions were generated as:
+To predict overall habitat suitability, all measured environmental covariates were included in the prediction:
 
 ```r
 pred_full <- predict(
@@ -454,104 +1079,59 @@ pred_full <- predict(
 )
 ```
 
-These maps represent predicted occurrence intensity arising from all environmental covariates combined.
+These predictions represent the combined influence of the environmental variables on shag occurrence and identify areas with relatively high or low predicted habitat suitability.
 
-The spatial random field was deliberately excluded from these predictions to facilitate ecological interpretation of habitat relationships.
+The spatial random field was intentionally excluded from these predictions because it captures unexplained spatial variation rather than the effects of the measured environmental variables. Excluding the spatial field therefore allows the maps to illustrate the ecological relationships represented by the covariates alone.
 
-## Interpretation of coefficients
+## Interpretation of model coefficients
 
-Because predictors are standardised, coefficients can be interpreted as effects associated with a one-standard-deviation change in a covariate.
+All environmental covariates were standardized before modelling. Consequently, each regression coefficient represents the expected change in occurrence intensity associated with a one-standard-deviation increase in the corresponding covariate.
 
-For example:
+Because the model uses a log link, coefficients are interpreted on an exponential scale.
 
-If
+For example, if the estimated coefficient is $\beta=-1$, then $exp(-1)=0.37$ indicating that the predicted occurrence intensity decreases to approximately **37%** of its original value (a **63% reduction**) for a one-standard-deviation increase in that predictor.
 
-$$
-\beta=-1
-$$
+Conversely, if $\beta=1$, then $exp(1)=2.72$ indicating that the predicted occurrence intensity is expected to be approximately **2.7 times greater** for a one-standard-deviation increase in the predictor.
 
-then
+In general, **negative coefficients indicate avoidance**, whereas **positive coefficients indicate preference**, after accounting for the other variables included in the model.
 
-$$
-exp(-1)=0.37
-$$
+# Sensitivity analyses
 
-meaning occurrence intensity is expected to decline by approximately 63% for a one-standard-deviation increase in the predictor.
+To assess whether our conclusions were robust to different modelling choices, we conducted a series of sensitivity analyses.
 
-Similarly,
+Specifically, we evaluated whether the results changed when:
 
-$$
-\beta=1
-$$
+- using the full tracking dataset or a temporally thinned dataset to reduce closely spaced observations;
+- applying different thinning distances;
+- fitting models with and without a spatial component;
+- changing the prior assumptions used for the spatial random field; and
+- comparing the environmental conditions at observed shag locations with those available across the study area.
 
-implies
-
-$$
-exp(1)=2.72
-$$
-
-meaning occurrence intensity is expected to increase approximately 2.7-fold.
-
-# Visualisation and sensitivity analyses
-
-## Visualisation
-
-Predictions were visualised using the colour-blind-safe **Cividis** palette.
-
-```r
-scale_colour_viridis_c(
-  option = "cividis"
-)
-```
-
-Maps contain three primary elements:
-
-| Layer | Representation |
-|---------|---------|
-| Predicted intensity | Cividis colour scale |
-| Shag locations | Orange points |
-| Harvest areas | Black outlines |
-
-This combination maximises interpretability while remaining accessible to readers with colour-vision deficiencies.
-
-
-## Sensitivity analyses
-
-Several sensitivity analyses were conducted to evaluate robustness.
-
-These included:
-
-- comparing thinned and unthinned datasets;
-- comparing multiple thinning distances;
-- evaluating non-spatial and spatial models;
-- varying SPDE prior assumptions;
-- examining environmental distributions at used and available locations.
-
-These analyses were used to assess the potential influence of spatial confounding and sampling redundancy on parameter estimates.
+These analyses allowed us to determine whether the estimated relationships between shag occurrence and environmental variables were consistent across a range of reasonable modelling assumptions. They also helped assess whether the results were influenced by repeated observations from the same individuals or by spatial clustering of tracking locations.
 
 # Reproducibility
 
-All model runs save:
+To ensure that all analyses can be reproduced, each model run automatically saves:
 
-- fitted models;
-- prediction surfaces;
-- summary statistics;
-- WAIC and DIC values;
-- prediction plots;
-- session information.
+- the fitted model;
+- predicted occurrence maps;
+- model summary statistics;
+- model comparison metrics (WAIC and DIC);
+- prediction figures; and
+- information about the R session and package versions used.
 
-This ensures complete reproducibility of analyses and facilitates future model comparisons.
+Saving these outputs provides a complete record of each analysis, making it straightforward to reproduce the results, compare alternative models, or extend the analyses in the future.
 
 # Summary
 
-The LGCP-INLA framework provides a flexible and statistically rigorous approach for modelling shag occurrence patterns.
+The log-Gaussian Cox process (LGCP) framework provides a flexible approach for modelling the spatial distribution of foraging shags.
 
-Key strengths of the approach include:
+This approach has several advantages:
 
-- direct modelling of occurrence intensity;
-- explicit treatment of spatial autocorrelation;
-- incorporation of environmental covariates as continuous spatial fields;
-- efficient Bayesian inference through INLA;
-- straightforward generation of habitat suitability surfaces.
+- it models where shags are most likely to occur across the study area;
+- it accounts for the fact that nearby observations are often more similar than those farther apart;
+- it incorporates environmental variables continuously across the landscape rather than only at observed locations;
+- it efficiently estimates model parameters using the INLA framework; and
+- it produces spatial predictions that can be mapped to identify areas of relatively high and low habitat suitability.
 
-The resulting models allow robust assessment of habitat associations while accounting for the spatial structure that characterises animal tracking data.
+Overall, the modelling framework provides a robust way to quantify how environmental conditions influence shag distribution while accounting for the spatial structure that is inherent in animal tracking data.

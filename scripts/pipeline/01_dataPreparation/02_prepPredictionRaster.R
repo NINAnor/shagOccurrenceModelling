@@ -48,6 +48,7 @@ build_or_load_year <- function(year_label, harvest_obj, importFile) {
     rr <- create_harvest_dist_rasters(
       harvest = harvest_obj,
       colony = colony,
+      study_region_list = study_region_list,
       resolution = 10,
       buffer_m = 33000 + 10000
     )

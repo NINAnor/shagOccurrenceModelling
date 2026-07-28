@@ -37,18 +37,33 @@ message("Loading base data (expect pre-saved R objects).")
 
 # Colony location (object: colony)
 load("../colony")         # defines 'colony' sf object
+colony <- sf::st_transform(colony,
+                           modelCrs)
 study_region <- sf::st_buffer(colony, dist = 33000)  # 33 km study buffer
+
 
 # Kelp forest polygons (object: tare)
 load("../tare")           # defines 'tare' sf object
+tare <- sf::st_transform(tare,
+                         modelCrs)
 
 # Dive locations: 2023 and 2024
 load("../dloc23")         # defines 'dloc23' (2023 dives)
+dloc23 <- dloc23 %>%
+  sf::st_transform(., modelCrs)
+
 load("../dloc24")         # defines 'dloc'  (2024 dives; named 'dloc' after loading)
+dloc <- dloc %>%
+  sf::st_transform(., modelCrs)
 
 # Harvest information (two datasets covering different year windows)
 load("../SK_35_22_23")    # defines 'SK_35km_22_23'
+SK_35km_22_23 <- SK_35km_22_23 %>%
+  sf::st_transform(., modelCrs)
+
 load("../SK_35_23_24")    # defines 'SK_35km_23_24'
+SK_35km_23_24 <- SK_35km_23_24 %>%
+  sf::st_transform(., modelCrs)
 
 # ----------------------------
 # Check that output path exists or will be created
@@ -151,6 +166,11 @@ if (exists("checks") && isTRUE(checks)) {
   print(table(dmodel$Year, dmodel$harvested50m, dmodel$random))
 }
 
+
+
+
+study_region_list <- study_region_details(study_region)
+
 # ============================================================
 # Environmental layers: create 10 m rasters and combine into env_stack_10m
 # Save to parquet for faster reload
@@ -163,31 +183,57 @@ env_parquet_path <- file.path(path_for_processed_data, "env_stack_10m.parquet")
 
 if (!file.exists(env_parquet_path)) {
 
-  study_region <- sf::st_buffer(colony, dist = 33000 + 10000)  # 33 km study buffer
+
 
   message("Creating 10 m environmental rasters (bathymetry, substrates, tareskog).")
 
   # 1) Load GEBCO bathymetry NetCDF and rasterise/reproject to 10 m template
-  gebco_nc <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/gebco_2019_n85.0_s50.0_w0.0_e40.0.nc"
+  gebco_nc <-
+    normalizePath(
+      file.path(
+        here::here(),
+        "..",
+        "..",
+        "Analyses_Nina_multiple_Sites",
+        "Environmental Covariates",
+        "gebco_2019_n85.0_s50.0_w0.0_e40.0.nc"
+      ),
+      winslash = "/"
+    )
+
+
+    #"~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/gebco_2019_n85.0_s50.0_w0.0_e40.0.nc"
   if (!file.exists(gebco_nc)) stop("GEBCO NetCDF not found at: ", gebco_nc)
 
   gebco <- terra::rast(gebco_nc)
 
   gebco_10m <- create_10m_raster(
     input_data = gebco,
-    study_region = study_region,
+    study_region_list = study_region_list,
     resolution = 10,
     raster_name = "bathymetry"
   ) |> terra::scale()
   # plot(gebco_10m)  # optional visual check
 
   # 2) Hard-substrate shapefile -> binary raster
-  hard_substr_shp <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Rock_hard_substr.shp"
+  hard_substr_shp <-    normalizePath(
+    file.path(
+      here::here(),
+      "..",
+      "..",
+      "Analyses_Nina_multiple_Sites",
+      "Environmental Covariates",
+      "Substrate_Rock_hard_substr.shp"
+    ),
+    winslash = "/"
+  )
+
+  #  "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Rock_hard_substr.shp"
   hard_substr <- sf::st_read(hard_substr_shp, quiet = TRUE)
 
   hard_substr_10m <- create_10m_raster(
     input_data = hard_substr,
-    study_region = study_region,
+    study_region_list = study_region_list,
     resolution = 10,
     field = 1,
     background = 0,
@@ -195,12 +241,24 @@ if (!file.exists(env_parquet_path)) {
   )
 
   # 3) Sediment substrate shapefile -> binary raster
-  sediment_shp <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Sediment.shp"
+  sediment_shp <- normalizePath(
+    file.path(
+      here::here(),
+      "..",
+      "..",
+      "Analyses_Nina_multiple_Sites",
+      "Environmental Covariates",
+      "Substrate_Sediment.shp"
+    ),
+    winslash = "/"
+  )
+
+   # "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Substrate_Sediment.shp"
   sediment_substr <- sf::st_read(sediment_shp, quiet = TRUE)
 
   sediment_substr_10m <- create_10m_raster(
     input_data = sediment_substr,
-    study_region = study_region,
+    study_region_list = study_region_list,
     resolution = 10,
     field = 1,
     background = 0,
@@ -208,12 +266,24 @@ if (!file.exists(env_parquet_path)) {
   )
 
   # 4) Kelp forest mask shapefile -> binary raster (tareskog)
-  tareskog_shp <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Tareskog_merge.shp"
+  tareskog_shp <- normalizePath(
+    file.path(
+      here::here(),
+      "..",
+      "..",
+      "Analyses_Nina_multiple_Sites",
+      "Environmental Covariates",
+      "Tareskog_merge.shp"
+    ),
+    winslash = "/"
+  )
+
+   # "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_multiple_Sites/Environmental Covariates/Tareskog_merge.shp"
   tareskog <- sf::st_read(tareskog_shp, quiet = TRUE)
 
   tareskog_10m <- create_10m_raster(
     input_data = tareskog,
-    study_region = study_region,
+    study_region_list = study_region_list,
     resolution = 10,
     field = 1,
     background = 0,
@@ -226,13 +296,22 @@ if (!file.exists(env_parquet_path)) {
 
   message("Environmental stack built: ", paste(names(env_stack_10m), collapse = ", "))
 
+ # out <- terra::writeRaster(
+ #    x = env_stack_10m,
+ #    filename = env_parquet_path,
+ #    overwrite = TRUE#,
+ #    # datatype = "FLT4S",
+ #    # gdal = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES")
+ #  )
+
   terra::writeRaster(
-    x = env_stack_10m,
+    env_stack_10m,
     filename = env_parquet_path,
+    filetype = "GTiff",
     overwrite = TRUE,
-    datatype = "FLT4S",
-    gdal = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES")
+    gdal = c("COMPRESS=NONE")
   )
+
   # Optional quick plots for sanity
   # plot(env_stack_10m)
 
@@ -251,7 +330,7 @@ if (!file.exists(env_parquet_path)) {
   }
 
   if(get_env_covs && importFile == "raster"){
-    env_stack_10m <- terra::rast(env_parquet_path, crs = sf::st_crs(study_region)$wkt)
+    env_stack_10m <- terra::rast(env_parquet_path)
   }
   # Optional: plot(env_stack_10m)
 }

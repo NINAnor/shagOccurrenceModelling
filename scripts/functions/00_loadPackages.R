@@ -34,7 +34,11 @@ necessaryPackages <- c("sf",
                        "smoothr",
                        "gam",
                       "spThin",
-                      "dbscan"
+                      "dbscan",
+                      "magrittr",
+                      "inlabru",
+                      "INLA",
+                      "fmesher"
 )
 uninstalledPackages <- necessaryPackages[!(necessaryPackages %in% row.names(installedPackages))]
 

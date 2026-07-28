@@ -32,12 +32,17 @@
 - `add_harvest_overlap()` — find earliest overlapping harvest time per point and classify before/after/noharvest.  
 - `finalise_dmodel()` — combine years, derive binary harvested flags and harvest-period labels.  
 - `make_year_dmodel()` — orchestrates steps for a single year; returns processed objects.  
+- `run_eda_by_year()` - run exploratory data analysis (EDA) on used-available data by year.
 - `create_10m_raster()` — reproject, crop/mask and rasterise/resample vector or raster input to a common grid.  
 - `create_harvest_dist_rasters()` — produce `harvested50m` / `harvested200m` rasters and distance-to-harvest/colony rasters.  
 - `fit_predict_habitat_model()` — fit GAM(s), compute partial effects and spatial predictions.  
 - `predict_maps_by_sex()`, `maps_by_sex_all_periods()` — produce sex- and period-specific prediction rasters and plots.  
 - `save_habitat_results_pro()` — save models, tables, sf layers, rasters and plots in multiple formats.  
 - `set_terra_threads()` — configure terra / OpenMP / GDAL / BLAS threading.
+- `create_fmesher_mesh_from_locations()` - create a two-dimensional finite element mesh for spatial SPDE models.
+- `choose_pc_priors_binomial()` - choose penalised complexity priors for an SPDE model.
+- `run_shag_inla_model()` - fit spatial and non-spatial Cox process habitat models using inlabru.
+- `save_inla_results()` - save outputs from an inlabru habitat model analysis.
 
 ---
 
@@ -77,7 +82,7 @@ run_env     <- "personal"  # or "server"
 
 ## Dependencies
 
- - R >= 4.0 recommended
+ - R >= 4.5 recommended because of the ``inlabru`` and ``INLA`` model internal functions needed to fit the model
  - Main packages (install if missing): ``sf``, ``terra``, ``dplyr``, ``mgcv``, 
  ``ggplot2``, ``tidyr``, ``purrr``, ``arrow``, ``GGally``, ``dbscan``
  - Optional and recommended: ``RhpcBLASctl`` (control BLAS threads)
@@ -92,15 +97,37 @@ run_env     <- "personal"  # or "server"
  
 ```r
 install.packages(c("sf",
-                    "terra",
-                    "dplyr",
-                    "mgcv",
-                    "ggplot2",
-                    "tidyr",
-                    "purrr",
-                    "arrow",
-                    "GGally",
-                    "dbscan"))
+                       "terra",
+                       "dplyr",
+                       "lubridate",
+                       "data.table",
+                       #"diveMove",
+                       "geosphere",
+                       "ggplot2",
+                       "adehabitatHR",
+                       "ggspatial",
+                       "pROC",
+                       "car",
+                       "ggiraphExtra",
+                       "ggeffects",
+                       "patchwork",
+                       "tidyr",
+                       "rlang",
+                       "purrr",
+                       "GGally",
+                       "arrow",
+                       "biomod2",
+                       "cito",
+                       "mda",
+                       "earth",
+                       "smoothr",
+                       "gam",
+                      "spThin",
+                      "dbscan",
+                      "magrittr",
+                      "inlabru",
+                      "INLA",
+                      "fmesher"))
                     
 # optional:
 install.packages("RhpcBLASctl")
@@ -108,10 +135,10 @@ install.packages("RhpcBLASctl")
  - Run the master script:
     
     * Interactive (R / RStudio): source the master script.
-    * Server (batch) with parameter-row index tpr:
+    * Server (batch) with parameter-row index param_row:
 
 ```bash
-Rscript scripts/fit_model_master.R 3
+Rscript scripts/masterScript.R 3
 ```
 The script reads the command-line argument to select a parameter row for batch runs. Ensure ``run_env`` in ``.Rprofile`` is set appropriately.
 

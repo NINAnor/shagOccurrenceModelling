@@ -1,14 +1,14 @@
-run_model <- function(param_row) {
+for (i in 1:12) {
+tryCatch({
 
-  assign(
-    "param_row",
-    param_row,
-    envir = .GlobalEnv
-  )
+  options(warn = 2)
+  on.exit(options(warn = 0), add = TRUE)
 
+  assign("param_row", i, envir = .GlobalEnv)
   source("scripts/masterScript.R")
-}
 
-for(i in 1:12){
-  run_model(i)
+}, error = function(e) {
+  message("Model ", i, ": ", conditionMessage(e))
+})
+
 }

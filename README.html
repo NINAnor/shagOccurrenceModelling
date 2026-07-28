@@ -428,6 +428,8 @@ harvested flags and harvest-period labels.<br />
 <li><code>make_year_dmodel()</code> — orchestrates steps for a single
 year; returns processed objects.<br />
 </li>
+<li><code>run_eda_by_year()</code> - run exploratory data analysis (EDA)
+on used-available data by year.</li>
 <li><code>create_10m_raster()</code> — reproject, crop/mask and
 rasterise/resample vector or raster input to a common grid.<br />
 </li>
@@ -447,6 +449,14 @@ layers, rasters and plots in multiple formats.<br />
 </li>
 <li><code>set_terra_threads()</code> — configure terra / OpenMP / GDAL /
 BLAS threading.</li>
+<li><code>create_fmesher_mesh_from_locations()</code> - create a
+two-dimensional finite element mesh for spatial SPDE models.</li>
+<li><code>choose_pc_priors_binomial()</code> - choose penalised
+complexity priors for an SPDE model.</li>
+<li><code>run_shag_inla_model()</code> - fit spatial and non-spatial Cox
+process habitat models using inlabru.</li>
+<li><code>save_inla_results()</code> - save outputs from an inlabru
+habitat model analysis.</li>
 </ul>
 <hr />
 </div>
@@ -501,7 +511,8 @@ run_env     &lt;- &quot;personal&quot;  # or &quot;server&quot;</code></pre>
 <div id="dependencies" class="section level2">
 <h2>Dependencies</h2>
 <ul>
-<li>R &gt;= 4.0 recommended</li>
+<li>R &gt;= 4.5 recommended because of the <code>inlabru</code> and
+<code>INLA</code> model internal functions needed to fit the model</li>
 <li>Main packages (install if missing): <code>sf</code>,
 <code>terra</code>, <code>dplyr</code>, <code>mgcv</code>,
 <code>ggplot2</code>, <code>tidyr</code>, <code>purrr</code>,
@@ -519,15 +530,37 @@ in expected locations.</p></li>
 <li><p>Install required packages:</p></li>
 </ul>
 <pre class="r"><code>install.packages(c(&quot;sf&quot;,
-                    &quot;terra&quot;,
-                    &quot;dplyr&quot;,
-                    &quot;mgcv&quot;,
-                    &quot;ggplot2&quot;,
-                    &quot;tidyr&quot;,
-                    &quot;purrr&quot;,
-                    &quot;arrow&quot;,
-                    &quot;GGally&quot;,
-                    &quot;dbscan&quot;))
+                       &quot;terra&quot;,
+                       &quot;dplyr&quot;,
+                       &quot;lubridate&quot;,
+                       &quot;data.table&quot;,
+                       #&quot;diveMove&quot;,
+                       &quot;geosphere&quot;,
+                       &quot;ggplot2&quot;,
+                       &quot;adehabitatHR&quot;,
+                       &quot;ggspatial&quot;,
+                       &quot;pROC&quot;,
+                       &quot;car&quot;,
+                       &quot;ggiraphExtra&quot;,
+                       &quot;ggeffects&quot;,
+                       &quot;patchwork&quot;,
+                       &quot;tidyr&quot;,
+                       &quot;rlang&quot;,
+                       &quot;purrr&quot;,
+                       &quot;GGally&quot;,
+                       &quot;arrow&quot;,
+                       &quot;biomod2&quot;,
+                       &quot;cito&quot;,
+                       &quot;mda&quot;,
+                       &quot;earth&quot;,
+                       &quot;smoothr&quot;,
+                       &quot;gam&quot;,
+                      &quot;spThin&quot;,
+                      &quot;dbscan&quot;,
+                      &quot;magrittr&quot;,
+                      &quot;inlabru&quot;,
+                      &quot;INLA&quot;,
+                      &quot;fmesher&quot;))
                     
 # optional:
 install.packages(&quot;RhpcBLASctl&quot;)</code></pre>
@@ -535,10 +568,10 @@ install.packages(&quot;RhpcBLASctl&quot;)</code></pre>
 <li><p>Run the master script:</p>
 <ul>
 <li>Interactive (R / RStudio): source the master script.</li>
-<li>Server (batch) with parameter-row index tpr:</li>
+<li>Server (batch) with parameter-row index param_row:</li>
 </ul></li>
 </ul>
-<pre class="bash"><code>Rscript scripts/fit_model_master.R 3</code></pre>
+<pre class="bash"><code>Rscript scripts/masterScript.R 3</code></pre>
 <p>The script reads the command-line argument to select a parameter row
 for batch runs. Ensure <code>run_env</code> in <code>.Rprofile</code> is
 set appropriately.</p>

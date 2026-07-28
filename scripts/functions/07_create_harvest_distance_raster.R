@@ -23,6 +23,7 @@
 create_harvest_dist_rasters <- function(harvest,
                                         colony,
                                         resolution = 200,
+                                        study_region_list,
                                         buffer_m = 33000) {
   # Dependency checks
   needed <- c("sf", "terra")
@@ -37,35 +38,57 @@ create_harvest_dist_rasters <- function(harvest,
   harvest <- sf::st_transform(harvest, sf::st_crs(colony))
 
   # Study region: buffer around colony
-  study_region <- sf::st_buffer(colony, dist = buffer_m)
-  study_union  <- sf::st_union(study_region)
-  study_vect   <- terra::vect(study_union)
+  study_union <- study_region_list$study_union
+    #harvest |> sf::st_buffer(dist = buffer_m)  |> sf::st_union()
+
+  # study_union_sf <- sf::st_sf(
+  #   geometry = study_union
+  # )
+
+  study_vect <- study_region_list$study_vect
+    #terra::vect(study_union_sf)
 
   # Template raster covering the study region
-  template <- terra::rast(
-    extent = terra::ext(study_vect),
-    resolution = resolution,
-    crs = terra::crs(study_vect)
-  )
+  template <- study_region_list$template
+  #   terra::rast(
+  #   extent = terra::ext(study_vect),
+  #   resolution = resolution,
+  #   crs = terra::crs(study_vect)
+  # )
 
   # Create unioned buffers around harvest polygons for 50m and 200m
   # Use st_union to collapse to single geometry per buffer to speed rasterize
   #harvest0 <- harvest |> sf::st_union() |> sf::st_make_valid()
+  harvest0  <- harvest |> sf::st_buffer(dist = 1)  |> sf::st_union() |> sf::st_make_valid()
   harvest50  <- harvest |> sf::st_buffer(dist = 50)  |> sf::st_union() |> sf::st_make_valid()
   harvest200 <- harvest |> sf::st_buffer(dist = 200) |> sf::st_union() |> sf::st_make_valid()
+  harvest1000 <- harvest |> sf::st_buffer(dist = 1000) |> sf::st_union() |> sf::st_make_valid()
+  harvest2000 <- harvest |> sf::st_buffer(dist = 2000) |> sf::st_union() |> sf::st_make_valid()
 
-  # Convert to terra vect for raster operations
-  #harvest0_vect  <- terra::vect(harvest0)
-  harvest50_vect  <- terra::vect(harvest50)
-  harvest200_vect <- terra::vect(harvest200)
+  to_vect <- function(x) {
+    x |>
+      sf::st_make_valid() |>
+      sf::st_as_sf() |>
+      terra::vect()
+  }
+
+  harvest0_vect  <- to_vect(sf::st_union(sf::st_buffer(harvest, 1)))
+  harvest50_vect <- to_vect(sf::st_union(sf::st_buffer(harvest, 50)))
+  harvest200_vect <- to_vect(sf::st_union(sf::st_buffer(harvest, 200)))
+  harvest1000_vect <- to_vect(sf::st_union(sf::st_buffer(harvest, 1000)))
+  harvest2000_vect <- to_vect(sf::st_union(sf::st_buffer(harvest, 2000)))
 
   # Rasterize buffers: 1 inside buffer, 0 outside. Use touches = TRUE to be conservative.
- # r_h0 <- terra::rasterize(harvest0_vect, template, field = 1, background = 0, touches = TRUE)
-  r_h50 <- terra::rasterize(harvest50_vect, template, field = 1, background = 0, touches = TRUE)
-  r_h200 <- terra::rasterize(harvest200_vect, template, field = 1, background = 0, touches = TRUE)
+  r_h0 <- terra::rasterize(harvest0_vect, template, field = 1, background = 0, touches = TRUE, fun = "max")
+  r_h50 <- terra::rasterize(harvest50_vect, template, field = 1, background = 0, touches = TRUE, fun = "max")
+  r_h200 <- terra::rasterize(harvest200_vect, template, field = 1, background = 0, touches = TRUE, fun = "max")
+  r_h1000 <- terra::rasterize(harvest1000_vect, template, field = 1, background = 0, touches = TRUE, fun = "max")
+  r_h2000 <- terra::rasterize(harvest2000_vect, template, field = 1, background = 0, touches = TRUE, fun = "max")
   names(r_h50)  <- "harvested50m"
   names(r_h200) <- "harvested200m"
-  #names(r_h0)  <- "harvested0m"
+  names(r_h0)  <- "harvested0m"
+  names(r_h2000) <- "harvested2000m"
+  names(r_h1000) <- "harvested1000m"
 
   # Distance to colony (meters): compute on template, mask to study region, scale
   colony_vect <- terra::vect(colony)
@@ -75,28 +98,41 @@ create_harvest_dist_rasters <- function(harvest,
   names(r_dist_nest) <- "DistNest"
 
   # Distance to harvest polygons (meters): compute to unioned harvest geometry
-  harvest_union <- sf::st_make_valid(sf::st_union(harvest))
-  harvest_vect  <- terra::vect(harvest_union)
+  harvest_vect <- harvest |>
+    sf::st_union() |>
+    sf::st_make_valid() |>
+    sf::st_as_sf() |>
+    terra::vect()
+
   r_dist_harv <- terra::distance(template, harvest_vect)
   r_dist_harv <- terra::mask(r_dist_harv, study_vect)
   r_dist_harv <- terra::scale(r_dist_harv)
   names(r_dist_harv) <- "DistHarvest"
 
   # Mask binary harvest rasters to study region for consistency
+  r_h0  <- terra::mask(r_h0, study_vect)
   r_h50  <- terra::mask(r_h50, study_vect)
   r_h200 <- terra::mask(r_h200, study_vect)
+  r_h2000 <- terra::mask(r_h2000, study_vect)
+  r_h1000 <- terra::mask(r_h1000, study_vect)
 
   # Combine into a stack (order important for downstream code)
-  raster_stack <- c(r_h50, r_h200, r_dist_nest, r_dist_harv)
+  raster_stack <- c(r_h0, r_h50, r_h200, r_h1000, r_h2000,r_dist_nest, r_dist_harv)
 
   list(
+    harvested1m = r_h0,
     harvested50m = r_h50,
     harvested200m = r_h200,
+    harvested2000m = r_h2000,
+    harvested1000m = r_h1000,
     DistNest = r_dist_nest,
     DistHarvest = r_dist_harv,
     raster_stack = raster_stack,
+    harvest1m_buffer = harvest0,
     harvest50_buffer = harvest50,
-    harvest200_buffer = harvest200
+    harvest200_buffer = harvest200,
+    harvest2000_buffer = harvest2000,
+    harvest1000_buffer = harvest1000
   )
 }
 
@@ -167,10 +203,20 @@ save_raster_results <- function(raster_results,
 
     # call writeRaster with user-provided tif_options (safe defaults exist)
     write_args <- c(list(x = raster_results$raster_stack,
-                         filename = tif_file, overwrite = TRUE),
-                    tif_options)
+                         filename = tif_file,
+                         filetype = "GTiff",
+                         overwrite = TRUE,
+                         gdal = c("COMPRESS=NONE"))#,
+                    #tif_options
+                    )
     do.call(terra::writeRaster, write_args)
-
+    # terra::writeRaster(
+    #   env_stack_10m,
+    #   filename = env_parquet_path,
+    #   filetype = "GTiff",
+    #   overwrite = TRUE,
+    #   gdal = c("COMPRESS=NONE")
+    # )
     # Save metadata (record path to tif in metadata)
     raster_metadata$raster_file <- tif_file
     message("Saved GeoTIFF to: ", tif_file)
