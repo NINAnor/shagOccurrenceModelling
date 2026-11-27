@@ -1,0 +1,5 @@
+"Step","Dives"
+"Raw dive records (2023 + 2024)",61835
+"After removing duplicate coordinates within a bird",46386
+"Dropped: on non-water cells",-222
+"Used in the INLA models",46164

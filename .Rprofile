@@ -1,6 +1,8 @@
 # .Rprofile (project root)
 # Read project-local .Renviron if present
-if (file.exists(".Renviron")) readRenviron(".Renviron")
+if (file.exists(".Renviron")) {
+  readRenviron(".Renviron")
+}
 
 # Runtime flag
 run_env <- Sys.getenv("RUN_ENV", unset = NA_character_)
@@ -31,10 +33,10 @@ if (tolower(run_env) == "nina") {
 if (tolower(run_env) == "nina") {
   data_dir <- "~/Mounts/R/Prosjekter/Toppskarv/Analyses_Nina_KelpHarvest/kwaku/dataset"
 } else {
-  data_dir_env <- "C:/ninaProjects/ninaDernhard" #Sys.getenv("DATA_DIR", unset = NA_character_)
+  # data_dir_env <- "C:/ninaProjects/ninaDernhard" #Sys.getenv("DATA_DIR", unset = NA_character_)
+  data_dir_env <- Sys.getenv("DATA_DIR", unset = NA_character_)
   data_dir <- path.expand(data_dir_env)
 }
-
 
 
 # path to the results directory
@@ -53,9 +55,15 @@ if (tolower(run_env) == "nina") {
 
 # Convenience helpers
 proj <- function(...) {
-  if (nargs() == 0L) return(normalizePath(project_dir, winslash = "/", mustWork = FALSE))
+  if (nargs() == 0L) {
+    return(normalizePath(project_dir, winslash = "/", mustWork = FALSE))
+  }
   args <- list(...)
-  normalizePath(do.call(file.path, c(project_dir, args)), winslash = "/", mustWork = FALSE)
+  normalizePath(
+    do.call(file.path, c(project_dir, args)),
+    winslash = "/",
+    mustWork = FALSE
+  )
 }
 
 goto <- function(...) {
@@ -72,5 +80,12 @@ assign("data_dir", data_dir, envir = .GlobalEnv)
 assign("result_dir", result_dir, envir = .GlobalEnv)
 assign("logs_dir", logs_dir, envir = .GlobalEnv)
 message("data_dir: ", data_dir)
-message("Project root: ", project_dir, "  |  RUN_ENV: ", run_env, "  |  temp_dir: ", temp_dir)
+message(
+  "Project root: ",
+  project_dir,
+  "  |  RUN_ENV: ",
+  run_env,
+  "  |  temp_dir: ",
+  temp_dir
+)
 options(myproject = project_dir)
