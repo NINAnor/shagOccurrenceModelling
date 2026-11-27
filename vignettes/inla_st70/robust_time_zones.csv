@@ -1,0 +1,15 @@
+"Year","sex","status","from","to","days","mean_beta","factor_exp_beta","harvest_dives"
+"2023","Male","prefers (robust)","10 Jun","10 Jun",1,2.85,17.26,130
+"2023","Male","prefers (robust)","12 Jun","12 Jun",1,1.66,5.26,41
+"2024","Female","prefers (robust)","08 Jun","08 Jun",1,2.23,9.26,289
+"2024","Female","prefers (robust)","10 Jun","10 Jun",1,1.52,4.57,143
+"2024","Female","prefers (robust)","12 Jun","12 Jun",1,1.34,3.82,96
+"2024","Female","avoids (robust)","26 Jun","26 Jun",1,-1.02,0.36,22
+"2024","Female","avoids (robust)","28 Jun","28 Jun",1,-0.89,0.41,31
+"2024","Male","prefers (robust)","14 Jun","14 Jun",1,1.23,3.41,97
+"2024","Male","prefers (robust)","16 Jun","16 Jun",1,0.63,1.88,56
+"2024","Male","avoids (robust)","20 Jun","20 Jun",1,-0.9,0.41,25
+"2024","Male","avoids (robust)","22 Jun","22 Jun",1,-1.06,0.35,28
+"2024","Male","avoids (robust)","02 Jul","02 Jul",1,-0.91,0.4,21
+"2024","Male","avoids (robust)","04 Jul","04 Jul",1,-0.62,0.54,47
+"2024","Male","avoids (robust)","06 Jul","06 Jul",1,-0.83,0.43,29
